@@ -3251,10 +3251,12 @@ def build_template(data, out_dir, source_paths=(), fallback_pdf=None,
     - 背景图: pymupdf 把排版引擎的原样 PDF (office 转换件; 几何不匹配时
       退到 rebuilt.pdf) 按 2px/pt 栅格化成 background.png,
       "原样张"视觉上由它保证;
-    - 字段层: index.cells 的每一格变成一个 Field, rect 为占页宽/页高的
-      比例坐标, fieldUuid 即索引 uuid —— header_fields/rows/by_label
-      的 value 引用同一 uuid, 前端回填定位零换算; 识别文字进 label
-      (不做覆盖层重画, 视觉以背景图为唯一真相, 覆盖层只在填值时出现)。
+    - 字段层: OpenCV 探测网格的每一格变成一个 Field (与背景表格线严格
+      对齐), rect 为占页宽/页高的比例坐标, uuid = uuid5(addr) 与
+      index.cells 同一 uuid —— header_fields/rows/by_label 的 value
+      引用同一 uuid, 回填定位零换算; index 解析好的样式/填充语义按
+      uuid 挂载, 识别文字进 label (不做覆盖层重画, 视觉以背景图为
+      唯一真相, 覆盖层只在填值时出现)。
     page.width/height 用背景图像素尺寸 (2px/pt 栅格的宽/高), 不是 PDF 点:
     前端字号公式 fontSizePt*2/page.width*100cqw (TemplatePage.vue) 和
     PrintPreview 的 page.width/2*25.4/72 (mm) 都按这个约定消费。
@@ -3292,20 +3294,18 @@ def build_template(data, out_dir, source_paths=(), fallback_pdf=None,
         if used_src:
             break
 
-    # 字段层: index.cells -> Field (uuid/几何/文本/样式与索引一致)
+    # 字段层: OpenCV 探测网格的每一格 -> Field, 与背景表格线严格对齐;
+    # uuid = uuid5(addr), 与 index.cells 同一 uuid, 回填定位零换算;
+    # index 解析好的样式 (字号/字体/颜色/对齐/合并文本/填充语义) 按 uuid
+    # 挂到对应格上, 没进 index 的普通格直接用自身文字层的样式。
+    # 识别文字一律进 label (不进 textOverride, 覆盖层只在运行时填值出现)
     ns = _INDEX_NS or _uuid.UUID('7d4f2a90-3b1c-5e6a-9f08-2d5b8c4a7e91')
     idx_cells = ((data.get('index') or {}).get('cells')) or {}
     W, H = data['width'], data['height']
     fields = []
-    for u, e in idx_cells.items():
-        x, y, w, h = e['x'], e['y'], e['w'], e['h']
-        size = e.get('size') or 10
-        if (not w or not h) and e.get('text'):
-            # 游离文字实体: 无框, 宽按字数估算, 基线坐标 -> 框顶
-            n = len(''.join(str(e['text']).split()))
-            w = w or n * size * dpi / 72.0
-            h = h or size * dpi / 72.0 * 1.4
-            y = y - h * 0.85
+    seen = set()
+
+    def _emit(u, x, y, w, h, ent, text, addr):
         w = min(w, W)
         h = min(h, H)
         x = max(0.0, min(x, W - w))
@@ -3313,26 +3313,42 @@ def build_template(data, out_dir, source_paths=(), fallback_pdf=None,
         f = {'fieldUuid': u,
              'rect': {'x': round(x / W, 6), 'y': round(y / H, 6),
                       'w': round(w / W, 6), 'h': round(h / H, 6)},
-             'style': _field_style(e, size)}
-        if e.get('text'):
-            # 识别文字进 label (区域属性/列表里可见), 不进 textOverride:
-            # textOverride 会触发白底覆盖层重画, DOM 字 metrics/对齐是
-            # 估算值, 叠在像素级背景上反而显假; 视觉以背景图为唯一真相,
-            # 覆盖层只在运行时填值 (previewValues) 时出现
-            f['label'] = e['text']
+             'style': _field_style(ent, round(ent.get('size') or 10, 2))}
+        if text:
+            f['label'] = text
+        if addr:
+            f['source'] = {'range': addr}
+        if ent.get('mode'):
+            f['mode'] = ent['mode']
+            if ent.get('placeholder'):
+                f['placeholder'] = ent['placeholder']
         fields.append(f)
-    if not fields:  # 无 index (图片/PDF 通路): 逐格退化生成
-        for i, c in enumerate(data.get('cells') or []):
-            a = c.get('addr') or f'#C{i}'
-            f = {'fieldUuid': str(_uuid.uuid5(ns, a)),
-                 'rect': {'x': round(c['x'] / W, 6),
-                          'y': round(c['y'] / H, 6),
-                          'w': round(c['w'] / W, 6),
-                          'h': round(c['h'] / H, 6)},
-                 'style': _field_style(c, round(c.get('size') or 10, 2))}
-            if c.get('text'):
-                f['label'] = c['text']
-            fields.append(f)
+        seen.add(u)
+
+    for c in data.get('cells') or []:
+        a = c.get('addr')
+        u = str(_uuid.uuid5(ns, a)) if a else str(
+            _uuid.uuid5(ns, f"#{c.get('row')},{c.get('col')}"))
+        e = idx_cells.get(u) or {}
+        # index 合并文本 (同 addr 游离文字按视觉行拼接) 优先于格内 text;
+        # 样式: index 解析结果覆盖格内原始属性
+        text = e.get('text') or (c.get('text') or '').strip() or None
+        ent = dict(c)
+        ent.update(e)
+        _emit(u, c['x'], c['y'], c['w'], c['h'], ent, text, a)
+    # index 里的游离文字实体 (监理单位/编号等, 无格子) 也生成字段,
+    # 几何按字号估算
+    for u, e in idx_cells.items():
+        if u in seen:
+            continue
+        x, y, w, h = e['x'], e['y'], e['w'], e['h']
+        size = e.get('size') or 10
+        if (not w or not h) and e.get('text'):
+            n = len(''.join(str(e['text']).split()))
+            w = w or n * size * dpi / 72.0
+            h = h or size * dpi / 72.0 * 1.4
+            y = y - h * 0.85
+        _emit(u, x, y, w, h, e, e.get('text'), e.get('addr'))
 
     form_meta = ((data.get('form') or {}).get('meta')) or {}
     tpl_name = (name or form_meta.get('title') or '未命名表单')
