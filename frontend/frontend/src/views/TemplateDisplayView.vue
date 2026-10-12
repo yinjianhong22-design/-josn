@@ -500,7 +500,7 @@ async function confirmDelete() {
 }
 async function upload(file?: File) {
   if (!file || busy.value) return
-  if (!/\.(pdf|xlsx?|docx?)$/i.test(file.name)) { error.value = '请选择 PDF、Excel 或 Word 文件'; return }
+  if (!/\.(pdf|xlsx?|docx?|png|jpe?g|bmp|tiff?|webp)$/i.test(file.name)) { error.value = '请选择 PDF、Excel、Word 或图片文件'; return }
   busy.value = true; error.value = ''; notice.value = ''
   try { display((await uploadTemplate(file)).template) }
   catch (e) { error.value = (e as Error).message }
@@ -831,11 +831,11 @@ onMounted(() => refresh().catch(() => { error.value = '无法连接文档服务�
   <PrintPreview v-if="printOpen && template" :template="template" :current-page="pageIndex" :preview-values="trialValues" @close="printOpen = false" />
   <div class="workspace" :inert="printOpen" @dragover.prevent @drop.prevent="drop">
     <input ref="sampleInput" class="file-input" type="file" accept="image/*" aria-label="上传样例图片文件" @change="showSample" />
-    <input ref="input" class="file-input" type="file" accept=".pdf,.xlsx,.xls,.docx,.doc" @change="onFile" />
+    <input ref="input" class="file-input" type="file" accept=".pdf,.xlsx,.xls,.docx,.doc,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp" @change="onFile" />
     <header class="appbar">
       <img class="app-logo" src="/logo.png" alt="SDIG" />
       <div class="app-actions">
-        <button class="text-button" :disabled="busy" title="文件页面会发送至 PaddleOCR 云端识别" @click="input?.click()">导入文件</button>
+        <button class="text-button" :disabled="busy" title="文件页面会发送至 PaddleOCR 云端识别" @click="input?.click()">导入文档</button>
         <button class="text-button" :disabled="!template || busy" @click="printOpen = true">打印预览</button>
         <button class="text-button" :disabled="!template" @click="jsonOpen = true">JSON</button>
         <button class="primary" :disabled="!template || busy || saved" @click="save">{{ saved ? '已保存' : '保存模板' }}</button>
@@ -852,7 +852,7 @@ onMounted(() => refresh().catch(() => { error.value = '无法连接文档服务�
         <template v-if="libraryTab === 'pages'">
           <div class="page-panel-fixed">
             <div class="section-title">页面 <span>{{ template?.pages.length || 0 }}</span></div>
-            <p v-if="!template" class="panel-empty">导入文件后显示页面</p>
+            <p v-if="!template" class="panel-empty">导入文档后显示页面</p>
             <button v-for="(p, index) in template?.pages || []" :key="p.pageUuid" class="page-item" :class="{ active: pageIndex === index }" @click="changePage(index)">
               <RiFilePaper2Line aria-hidden="true" />
               <span class="page-item-info">
@@ -893,7 +893,7 @@ onMounted(() => refresh().catch(() => { error.value = '无法连接文档服务�
             <div v-if="sampleUrl" class="sample-artboard" :style="{ width: (794 * zoom / 100) + 'px' }"><div class="artboard-label sample-artboard-label"><span>样例图片</span><span :title="sampleName">{{ sampleName }}</span></div><SourceSample :url="sampleUrl" :sample="sampleResult" :mapping="currentMapping" :picking="picking" :selected-ids="sourceTextIds" @text="chooseSourceText" @area="chooseSource({rect:$event})" /></div>
             <div class="page-wrap" :style="{ width: (794 * zoom / 100) + 'px' }"><div class="artboard-label">{{ sampleUrl ? '目标模板 · ' : '' }}页面 {{ page.pageNo }}</div><div class="page-viewport" :style="{ height: (794 * zoom / 100 * page.height / page.width) + 'px' }"><TemplatePage :style="{ width: '794px', transform: `scale(${zoom / 100})`, transformOrigin: 'top left' }" :preview-values="trialValues" :page="page" :selected-ids="selectedIds" :show-regions="showRegions" :show-background="showBackground" :split-guide="splitDraft" @select="selectField" @resize="resizeField" @split-move="updateSplitPosition" /></div></div>
           </div>
-          <div v-else class="empty-canvas"><RiBrushAiLine aria-hidden="true" /><p>拖入文件开始编辑</p><button class="secondary" :disabled="busy" @click="input?.click()">导入 PDF / Excel / Word</button><p class="cloud-note">页面图像会发送至 PaddleOCR 云端识别</p></div>
+          <div v-else class="empty-canvas"><RiBrushAiLine aria-hidden="true" /><p>拖入文件开始编辑</p><button class="secondary" :disabled="busy" @click="input?.click()">导入文档</button><p class="cloud-note">页面图像会发送至 PaddleOCR 云端识别</p></div>
         </div>
         <div class="canvas-tools" aria-label="画布工具">
           <button class="tool-button" :class="{ active: tool === 'select' }" aria-label="选择工具" :aria-pressed="tool === 'select'" title="选择" @click="tool = 'select'"><RiSendPlaneLine class="flip-x" aria-hidden="true" /></button>

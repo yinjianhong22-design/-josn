@@ -25,7 +25,8 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 # 扫描模板时跳过的目录
 _SKIP_DIRS = {'.git', '.venv', 'node_modules', '_tmp_form', '_uploads',
               'dist', '__pycache__'}
-_EXT_OK = ('.xlsx', '.xls', '.docx', '.doc', '.pdf')
+_EXT_OK = ('.xlsx', '.xls', '.docx', '.doc', '.pdf',
+           '.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp')
 
 _registry = {}  # templateUuid -> template.json 绝对路径
 
@@ -91,10 +92,10 @@ def convert_upload(src_path, stem, root, out_base):
                                     source_paths=[office_pdf],
                                     fallback_pdf=pdf_path, name=stem,
                                     bg_url=bg_url)
-    else:  # pdf
+    else:  # pdf / 图片: PDF 走文字层直提, 图片(扫描件)走 OCR 识别算法
         data = extract_grid.extract_page(src_path, args.page, args)
         if not data:
-            raise RuntimeError('PDF 页面提取失败')
+            raise RuntimeError('页面提取失败')
         extract_grid.generate_frontend(data, out_dir)
         pdf_path = extract_grid.json_to_pdf(
             data, os.path.join(out_dir, 'rebuilt.pdf'))

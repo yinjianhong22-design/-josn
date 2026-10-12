@@ -1059,16 +1059,20 @@ def ocr_cells_baidu(img, cells, ak, sk, api='accurate_basic', inset=4):
 
 
 def _pick_ocr_backend(args):
-    """按命令行参数选择 OCR 后端, 返回 (名称, (img, cells) -> dict)。"""
+    """按命令行参数选择 OCR 后端, 返回 (名称, (img, cells) -> dict)。
+
+    云端优先: PaddleOCR API > 百度智能云 > 本地 RapidOCR;
+    扫描件/图片的格子文字由选中的后端逐格识别。
+    """
+    if args.paddle_url and args.paddle_token:
+        return ('PaddleOCR API',
+                lambda img, cl: ocr_cells_paddle(img, cl, args.paddle_url,
+                                                 args.paddle_token))
     if args.baidu_ak and args.baidu_sk:
         return (f'百度智能云文字识别 ({args.baidu_api})',
                 lambda img, cl: ocr_cells_baidu(img, cl, args.baidu_ak,
                                                 args.baidu_sk,
                                                 api=args.baidu_api))
-    if args.paddle_url and args.paddle_token:
-        return ('PaddleOCR API',
-                lambda img, cl: ocr_cells_paddle(img, cl, args.paddle_url,
-                                                 args.paddle_token))
     return 'RapidOCR (本地)', ocr_cells
 
 
@@ -3227,6 +3231,8 @@ _FONT_ALIASES = {
     'ArialMT': 'Arial', 'TimesNewRomanPSMT': 'Times New Roman',
 }
 
+_IMG_EXT = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp')
+
 
 def _field_style(e, size):
     """index.cells 实体 -> 前端 FieldStyle (字体/字号/颜色/对齐)。"""
@@ -3268,13 +3274,27 @@ def build_template(data, out_dir, source_paths=(), fallback_pdf=None,
     pt_w = data['width'] * 72.0 / dpi
     pt_h = data['height'] * 72.0 / dpi
 
-    # 背景源: 逐个候选试, 几何 (页面点大小) 与 data 一致才采用
+    # 背景源: 逐个候选试, 几何 (页面点大小) 与 data 一致才采用;
+    # 图片(扫描件)候选直接作背景, 归一化到 2px/pt 约定
     bg_path = os.path.join(out_dir, 'background.png')
     used_src = None
     bg_wh = None
     for cand in list(source_paths) + ([fallback_pdf] if fallback_pdf else []):
         if not cand or not os.path.exists(cand):
             continue
+        if os.path.splitext(cand)[1].lower() in _IMG_EXT:
+            img = cv2.imread(cand)
+            if img is None:
+                continue
+            tw, th = round(pt_w * 2), round(pt_h * 2)
+            if (img.shape[1], img.shape[0]) != (tw, th):
+                interp = (cv2.INTER_AREA if img.shape[1] > tw
+                          else cv2.INTER_CUBIC)
+                img = cv2.resize(img, (tw, th), interpolation=interp)
+            cv2.imwrite(bg_path, img)
+            used_src = cand
+            bg_wh = (tw, th)
+            break
         doc = None
         try:
             doc = fitz.open(cand)
