@@ -14,6 +14,12 @@ Excel (.xlsx): 逐 sheet 遍历, 值/公式/样式/合并区域分开记录。
 原生 workbook, 给格子赋稳定地址 addr (Sheet1!B2) 和 value/formula/
 number_format; 再做角色标注 (title|header|label|value|data) 与字段配对,
 产出 fields (标签->填空格/内联冒号) 和 table_fields (表体行->可填列)。
+data['form'] 是可索引视图: 每条字段一个扁平文档 (唯一 id/name/mode/addr/
+几何平铺, 同名带 context 消歧); data['index'] 是可填充索引, 表头行为
+分界线: header_fields (以上, 目录 context 纯字典填充) + rows (以下, 数
+据简表按 行标签+列名 填充) + by_label (全表兜底), uuid 确定性生成,
+cells 表带几何与填充 mode (overwrite/replace/append/inline), 边界情况
+全部进 report。渲染层 cells/texts/rules 保持不变。
 回填契约: 按 addr 找到格子, 改 text、删 lines, 几何与边框不动。
 
 用法:
@@ -1897,16 +1903,40 @@ def augment_xlsx_semantics(page_data, wb_f, wb_v, max_candidates=50):
     阈值 max(3, 0.6×非空探测格), 跨 sheet 取总分最高, 不达标该页跳过
     (JSON 退回纯视觉, 不产生错误地址)。命中后逐格赋
     addr ("Sheet1!B2") 及 value/formula/number_format,
+    字体样式 (font_size/font_bold/font_name/font_color/font_align),
     游离文字行能整行匹配原生格的也补 addr。
+    字号字体对回填渲染是必需信息: 空值格 PDF 里没有文字层, 只能从
+    原生字体取 (PDF 文字层的实际打印字号优先, 见 build_index.ref)。
     """
     from openpyxl.utils import get_column_letter
 
     sheets = []
     for name in wb_f.sheetnames:
         ws, wsv = wb_f[name], wb_v[name]
-        disp, sem = {}, {}
+        disp, sem, fonts, aligns = {}, {}, {}, {}
         for row in ws.iter_rows():
             for cell in row:
+                fnt = cell.font
+                if fnt is not None:
+                    fe = {}
+                    if fnt.sz:
+                        fe['size'] = float(fnt.sz)
+                    if fnt.b:
+                        fe['bold'] = True
+                    if fnt.name:
+                        fe['name'] = fnt.name
+                    try:
+                        if fnt.color and fnt.color.rgb \
+                                and isinstance(fnt.color.rgb, str):
+                            fe['color'] = '#' + fnt.color.rgb[-6:]
+                    except Exception:
+                        pass
+                    if fe:
+                        fonts[(cell.row, cell.column)] = fe
+                al = cell.alignment
+                if al is not None and al.horizontal in (
+                        'left', 'right', 'center'):
+                    aligns[(cell.row, cell.column)] = al.horizontal
                 v = cell.value
                 nf = cell.number_format
                 if v is None and (not nf or nf == 'General'):
@@ -1925,7 +1955,8 @@ def augment_xlsx_semantics(page_data, wb_f, wb_v, max_candidates=50):
                 if nf and nf != 'General':
                     ent['number_format'] = nf
                 sem[(r, c)] = ent
-        sheets.append((name, disp, sem, ws.max_row, ws.max_column))
+        sheets.append((name, disp, sem, ws.max_row, ws.max_column, fonts,
+                       aligns))
 
     anchors = [(_norm_text(c.get('text') or ''), c['row'], c['col'])
                for c in page_data['cells']]
@@ -1934,7 +1965,7 @@ def augment_xlsx_semantics(page_data, wb_f, wb_v, max_candidates=50):
         return
     votes = {}
     for t, row, col in anchors:
-        for name, disp, _, _, _ in sheets:
+        for name, disp, _, _, _, _, _ in sheets:
             for (r, c), dt in disp.items():
                 if dt == t:
                     key = (name, r - 1 - row, c - 1 - col)
@@ -1946,7 +1977,7 @@ def augment_xlsx_semantics(page_data, wb_f, wb_v, max_candidates=50):
     best = None  # (matches, total, name, dr, dc)
     for (name, dr, dc), _ in sorted(votes.items(), key=lambda kv: -kv[1]
                                     )[:max_candidates]:
-        disp = next(d for n, d, _, _, _ in sheets if n == name)
+        disp = next(d for n, d, _, _, _, _, _ in sheets if n == name)
         matches = total = 0
         for c in page_data['cells']:
             t = _norm_text(c.get('text') or '')
@@ -1964,7 +1995,8 @@ def augment_xlsx_semantics(page_data, wb_f, wb_v, max_candidates=50):
         return
     print(f'语义对齐: {name} 偏移=({dr},{dc}) 匹配 {matches}/{total}')
 
-    _, _, sem, max_row, max_col = next(s for s in sheets if s[0] == name)
+    _, _, sem, max_row, max_col, fonts, aligns = next(
+        s for s in sheets if s[0] == name)
     for c in page_data['cells']:
         r, cc = c['row'] + dr + 1, c['col'] + dc + 1
         if not (1 <= r <= max_row and 1 <= cc <= max_col):
@@ -1972,6 +2004,19 @@ def augment_xlsx_semantics(page_data, wb_f, wb_v, max_candidates=50):
         # 使用范围内每格都给 addr (空格是主要回填目标, 不能因为原生为空而缺地址)
         c['addr'] = f"{name}!{get_column_letter(cc)}{r}"
         c.update(sem.get((r, cc), {}))
+        fnt = fonts.get((r, cc))
+        if fnt:
+            if fnt.get('size') is not None:
+                c.setdefault('font_size', fnt['size'])
+            if fnt.get('bold'):
+                c.setdefault('font_bold', True)
+            if fnt.get('name'):
+                c.setdefault('font_name', fnt['name'])
+            if fnt.get('color'):
+                c.setdefault('font_color', fnt['color'])
+        al = aligns.get((r, cc))
+        if al:
+            c.setdefault('font_align', al)
         # 格内右侧留白: colspan 范围内除锚点外还有原生空格 -> 值可追加
         if (c.get('text') or '').strip():
             room = sum(1 for k in range(cc + 1, min(cc + c.get('colspan', 1),
@@ -2313,6 +2358,459 @@ def extract_fields(data):
           f'table_fields {len(table_fields)} 行')
 
 
+def build_form_view(data):
+    """把 fields/table_fields 整理成可索引的 form 视图, 嵌入 data['form']。
+
+    为后续建立索引设计, 不是简单组合:
+    - 每个字段是一条扁平文档: name/mode/addr/几何坐标全在同一层,
+      索引导入时无需展开嵌套对象;
+    - 每条有全局唯一 id (F01..), 重名字段 (如两个"年月日") 按 id 区分,
+      name 只做匹配键;
+    - 同名/易混字段带 context: 同行最近左侧标签 (如 年月日@抽检时间),
+      供检索时消歧;
+    - 值格几何 (x/y/w/h, 像素, 基于 data['dpi']) 平铺在字段上,
+      索引命中即可直接渲染, 不必回 cells 查表。
+    mode 语义:
+      cell    值写入空格 (改 value_addr 对应格 text)
+      append  值追加在同行标签之后 (label/value 同格)
+      replace 整格替换 (占位文字视为示例值)
+      inline  同行冒号内联, 替换 prefix 之后的文本
+    游离文字的值宽按字号估算 (estimated=true)。渲染层 cells/texts/rules
+    保持不变, json_to_pdf / index.html 照常消费。
+    """
+    by_addr = {}
+    cells = data['cells']
+    for c in cells:
+        if c.get('addr'):
+            by_addr[c['addr']] = c
+    for i, t in enumerate(data.get('texts') or []):
+        by_addr[t['addr'] if t.get('addr') else f'#T{i}'] = t
+    by_grid = {(c['row'], c['col']): c for c in cells}
+
+    def _flat(addr):
+        """addr -> 扁平几何/文本属性 (px); 游离文字宽度按字号估算。"""
+        ent = by_addr.get(addr)
+        if ent is None:
+            return {'addr': addr}
+        d = {'addr': addr,
+             'x': round(ent['x'], 1), 'y': round(ent['y'], 1),
+             'w': round(ent.get('w') or 0, 1),
+             'h': round(ent.get('h') or 0, 1)}
+        if ent.get('text'):
+            d['text'] = ent['text']
+        if ent.get('size'):
+            d['size'] = round(ent['size'], 2)
+        if ent.get('fillable'):
+            d['fillable'] = True
+        if 'w' not in ent and ent.get('size'):   # 游离文字: 无实体宽
+            n = len(''.join(str(ent.get('text') or '').split()))
+            d['w'] = round(n * ent['size'] * data.get('dpi', 96) / 72.0, 1)
+            d['estimated'] = True
+        return d
+
+    def _context(ent):
+        """值格同行最近左侧的标签样文本 (同名字段消歧用)。"""
+        if ent is None or (ent.get('row') is None):
+            return None, None
+        best = None
+        for c in cells:
+            if c['row'] != ent.get('row') or c['col'] >= ent.get('col', 0):
+                continue
+            t = (c.get('text') or '').replace('\n', '').strip()
+            if t and len(t) <= 12 and t[0] not in _NO_LABEL_PREFIX:
+                if best is None or c['col'] > best['col']:
+                    best = c
+        if best is None:
+            return None, None
+        return (best.get('text') or '').replace('\n', '').strip(), \
+            best.get('addr')
+
+    form_fields = []
+    for i, f in enumerate(data.get('fields') or []):
+        mode = ('inline' if f.get('inline') else
+                'replace' if f.get('replace') else
+                'append' if f.get('append') else 'cell')
+        doc = {'id': f'F{i + 1:02d}', 'name': f['name'], 'mode': mode}
+        label_ent = by_addr.get(f.get('label') or '')
+        value_ent = by_addr.get(f.get('value') or '')
+        if label_ent is not None:
+            doc['label_addr'] = f['label']
+            if label_ent.get('text'):
+                doc['label_text'] = label_ent['text']
+        if value_ent is not None and f.get('value'):
+            v = _flat(f['value'])
+            doc['value_addr'] = v.pop('addr')
+            doc.update(v)
+        for k in ('prefix', 'underscore', 'value_seg'):
+            if k in f:
+                doc[k] = f[k]
+        ctx_text, ctx_addr = _context(value_ent or label_ent)
+        if ctx_text and ctx_text != f['name']:
+            doc['context'] = ctx_text
+            if ctx_addr:
+                doc['context_addr'] = ctx_addr
+        form_fields.append(doc)
+
+    form = {'meta': {'dpi': data.get('dpi'), 'width': data.get('width'),
+                     'height': data.get('height')},
+            'fields': form_fields}
+    titles = [t for t in data.get('texts') or [] if t.get('role') == 'title']
+    if titles:
+        form['meta']['title'] = max(titles, key=lambda t: t.get('size', 0)) \
+            ['text'].strip()
+
+    rows = data.get('table_fields') or []
+    if rows:
+        headers = []
+        for r in rows:
+            for h in r['cells']:
+                if h not in headers:
+                    headers.append(h)
+        table_rows = []
+        for i, r in enumerate(rows):
+            row_doc = {'id': f'R{i + 1:02d}', 'label': r['row_label']}
+            if r.get('row'):
+                row_doc['label_addr'] = r['row']
+            row_doc['cells'] = {h: _flat(a) for h, a in r['cells'].items()}
+            table_rows.append(row_doc)
+        form['table'] = {'headers': headers, 'rows': table_rows}
+    data['form'] = form
+    print(f'form 视图: 字段 {len(form_fields)} 个'
+          + (f', 表体 {len(rows)} 行' if rows else ''))
+
+
+# ---------------------------------------------------------------------------
+# 可填充索引 index: by_label + header_fields + rows (+ cells + report)
+#
+# 表头行 (role=header, 含"规定值"类列名的行) 为分界线, 构建时自动识别:
+#   表头行以上 -> 上下文区: label 格 -> 同排右侧值格, 进 header_fields,
+#                 目录 context 纯字典查找填充 (空值格=覆盖写, 带占位文本=
+#                 inline 替换), 与数据区互不干扰;
+#   表头行以下 -> 数据区: 按行分组还原 "字段 -> 规定值/实测值/合格率" 结构,
+#                 进 rows, 数据简表按 行标签+列名 填充;
+#   全表       -> by_label: 所有带 label 的字段 (兜底和通用查找)。
+# uuid 由 addr 确定性生成 (uuid5), 同表重建一致; cells 表携带每格几何/
+# 占位文本/mode, 回填渲染只查 cells[uuid]。占位覆盖/无值格/缺列等边界
+# 构建期全部进 report, 不等到运行期。
+#
+# 填充语义 (cells[uuid] 的 mode):
+#   overwrite  text 为空, 直接写入 value
+#   replace    整格替换 (占位文字视为示例值, 如 工程部位 的 "土方路基")
+#   append     值追加在占位文本之后 (标签与值同格, 如 抽检时间)
+#   inline     替换占位文本片段 (同行冒号内联, 如 编号: JB12-...)
+# ---------------------------------------------------------------------------
+
+_INDEX_NS = None  # uuid5 namespace, 延迟生成
+
+
+def build_index(data):
+    """按上述契约生成 data['index']。依赖 extract_fields/assign_roles
+    的配对结果 (fields) 与网格几何, 在 build_form_view 之后调用。"""
+    import re
+    import uuid
+    global _INDEX_NS
+    if _INDEX_NS is None:
+        _INDEX_NS = uuid.UUID('7d4f2a90-3b1c-5e6a-9f08-2d5b8c4a7e91')
+
+    def norm(s):
+        return re.sub(r'\s+', '', str(s or ''))
+
+    cells = data['cells']
+    by_grid = {(c['row'], c['col']): c for c in cells}
+    header_row = min((c['row'] for c in cells if c.get('role') == 'header'),
+                     default=None)
+
+    # 同 addr 的游离文字按视觉行拼接 (一个原生格常被拆成多个 seg,
+    # 如 A3 = "监理单位：..." + "JB12-4.2.2-"), 拼接后占位提取才完整
+    merged_text = {}
+    for grp in _group_free_text_lines(data.get('texts') or []):
+        by_a = {}
+        for it in grp['items']:
+            t = data['texts'][it['idx']]
+            if t.get('addr'):
+                by_a.setdefault(t['addr'], []).append(it)
+        for a, items in by_a.items():
+            merged_text[a] = ''.join(
+                data['texts'][it['idx']]['text']
+                for it in sorted(items, key=lambda i: i['x']))
+
+    idx_cells, report = {}, []
+    _noaddr = {}  # id(cell) -> uuid (无 addr 的格, 每次运行不同)
+
+    def ref(c):
+        """cell -> uuid, 并登记进 cells 表 (几何/文本/占位)。"""
+        a = c.get('addr')
+        if a:
+            u = str(uuid.uuid5(_INDEX_NS, a))
+        else:
+            u = _noaddr.setdefault(id(c), str(uuid.uuid4()))
+        if u not in idx_cells:
+            e = {'addr': a, 'x': round(c['x'], 1), 'y': round(c['y'], 1),
+                 'w': round(c.get('w') or 0, 1),
+                 'h': round(c.get('h') or 0, 1)}
+            t = merged_text.get(a, (c.get('text') or '').strip())
+            if t:
+                e['text'] = t
+            # 字号/字体/颜色: PDF 文字层 (lines, 实际打印样式) > 顶层原生
+            # 属性 (docx/xlsx 简化排版通路) > openpyxl 原生字体 (空值格
+            # 唯一来源) > 无; 对齐只有原生侧可得。
+            # 渲染层按此复原字体 (build_template -> style.fontFamily 等)
+            ln0 = (c.get('lines') or [{}])[0] or {}
+            size = c.get('size') or ln0.get('size') or c.get('font_size')
+            bold = (c.get('bold') or ln0.get('bold')
+                    or c.get('font_bold'))
+            family = (c.get('font') or ln0.get('font')
+                      or c.get('font_name'))
+            color = (c.get('color') or ln0.get('color')
+                     or c.get('font_color'))
+            align = c.get('align') or c.get('font_align')
+            if size:
+                e['size'] = round(float(size), 2)
+            if bold:
+                e['bold'] = True
+            if family:
+                e['font'] = str(family)
+            if color:
+                e['color'] = str(color)
+            if align:
+                e['align'] = align
+            idx_cells[u] = e
+        return u
+
+    def mode_of(u, f):
+        """按 fields 的配对 mode 标注定填充方式; 占位文本进报告。
+
+        append 型以 prefix 为占位: 值插在标签之后, 原标签后的其余
+        内容 (如共享格里的下一字段) 保留。
+        """
+        if f.get('inline'):
+            mode = 'inline'
+        elif f.get('replace'):
+            mode = 'replace'
+        elif f.get('append'):
+            mode = 'append'
+        else:
+            mode = 'overwrite'
+        text = idx_cells[u].get('text')
+        if mode == 'append' and f.get('prefix'):
+            placeholder = f['prefix']
+        elif mode == 'inline' and text:
+            # 占位 = 最后一个冒号之后的值文本 (整行共享格/整格内联均适用)
+            tail = re.split(r'[:：]', text)[-1]
+            placeholder = tail.strip() or text
+        elif text:
+            placeholder = text
+        else:
+            placeholder = None
+        idx_cells[u]['mode'] = mode
+        if placeholder:
+            idx_cells[u]['placeholder'] = placeholder
+            report.append({
+                'level': 'info', 'type': 'placeholder_fill',
+                'field': f['name'], 'cell': u, 'addr': idx_cells[u]['addr'],
+                'placeholder': placeholder, 'mode': mode,
+                'message': f'"{f["name"]}" 值格含占位文本 '
+                           f'"{placeholder}", 按 {mode} 填充'})
+        return mode
+
+    header_fields, by_label, rows = {}, {}, []
+
+    def add_label(c, value_u):
+        t = norm((c.get('text') or '').replace('\n', ''))
+        if not t:
+            return
+        ent = by_label.setdefault(t, [])
+        u = ref(c)
+        if any(e['cell'] == u for e in ent):
+            return
+        e = {'cell': u}
+        if value_u:
+            e['value'] = value_u
+        ent.append(e)
+
+    if header_row is None:
+        report.append({'level': 'warn', 'type': 'no_header',
+                       'message': '未识别到表头行, header_fields/rows 为空, '
+                                  '仅 by_label 可用'})
+    # label 可能是格子也可能是游离文字 (监理单位/编号), 游离文字无
+    # 行号, 上下文区用 y 坐标与表头行比较定区
+    all_ents = list(cells) + list(data.get('texts') or [])
+
+    def find_ent(addr):
+        return next((c for c in all_ents if c.get('addr') == addr), None)
+
+    if header_row is not None:
+        hdr_y = min(c['y'] for c in cells if c['row'] == header_row)
+        # ---- 上下文区: 表头行以上的 fields (label -> 同排右侧值格) ----
+        for f in data.get('fields') or []:
+            label_ent = find_ent(f.get('label'))
+            if label_ent is None or label_ent.get('y', 0) >= hdr_y:
+                continue  # 表尾/表内字段 (检查结论/审核日期等) 不进 header_fields
+            if not f.get('value') and not (f.get('inline')
+                                           and f.get('prefix')):
+                report.append({'level': 'warn', 'type': 'no_value_cell',
+                               'field': f['name'], 'addr': f.get('label'),
+                               'message': f'"{f["name"]}" 未配到值格, '
+                                          f'仅进 by_label'})
+                add_label(label_ent, None)
+                continue
+            value_ent = find_ent(f.get('value'))
+            if value_ent is None:
+                value_ent = label_ent   # 标签与值同格 (内联前缀型), 追加填充
+                f = {**f, 'inline': False, 'append': True}
+            u = ref(value_ent)
+            key = norm(f['name'])
+
+            def _reg_label():
+                # 以字段名登记 by_label (label 全文可能含多字段, 如 A3 行)
+                ent = by_label.setdefault(key, [])
+                if not any(x['cell'] == ref(label_ent) for x in ent):
+                    x = {'cell': ref(label_ent)}
+                    if u != ref(label_ent):
+                        x['value'] = u
+                    ent.append(x)
+
+            if key in header_fields:
+                report.append({'level': 'warn', 'type': 'dup_field',
+                               'field': key,
+                               'message': f'上下文区重名字段 "{key}", 后者 '
+                                          f'仅进 by_label'})
+                _reg_label()
+                continue
+            header_fields[key] = {'cell': u}
+            header_fields[key]['mode'] = mode_of(u, f)
+            _reg_label()
+
+        # ---- 数据区: 表体行 -> 字段 -> 各列 (规定值/实测值/合格率) ----
+        headers = {}
+        for c in cells:
+            if c['row'] == header_row and (c.get('text') or '').strip():
+                headers.setdefault(c['col'],
+                                   (c.get('text') or '').replace('\n', '')
+                                   .strip())
+        table_rows = _table_rows_set(cells, header_row)
+        counts = {}
+        for c in cells:
+            if c['row'] in table_rows and (c.get('text') or '').strip():
+                counts[c['col']] = counts.get(c['col'], 0) + 1
+        if counts and headers:
+            label_col = max(counts, key=counts.get)
+            for r in sorted(table_rows):
+                kc = by_grid.get((r, label_col))
+                kt = (kc.get('text') or '').replace('\n', '').strip() \
+                    if kc else ''
+                if not kt:
+                    continue  # 专用填写行/备用空行
+                row_doc = {'key': kt, 'key_cell': ref(kc)}
+                add_label(kc, None)
+                for hc, hname in headers.items():
+                    if hc == label_col:
+                        continue
+                    target = by_grid.get((r, hc))
+                    if target is None or not (target.get('text') or '') \
+                            .strip():
+                        target = None
+                        for rr in (r + 1, r):
+                            tc = by_grid.get((rr, hc))
+                            if tc is None \
+                                    or (tc.get('text') or '').strip() \
+                                    or not tc.get('addr'):
+                                continue
+                            if rr == r + 1:
+                                lbl = by_grid.get((rr, label_col))
+                                if lbl is not None \
+                                        and (lbl.get('text') or '').strip():
+                                    continue
+                            target = tc
+                            break
+                    if target is None or not target.get('addr'):
+                        report.append({'level': 'warn',
+                                       'type': 'missing_col',
+                                       'row': kt, 'col': hname,
+                                       'message': f'行 "{kt}" 缺列 '
+                                                  f'"{hname}" 的值格'})
+                        continue
+                    col = {'cell': ref(target)}
+                    if (target.get('text') or '').strip():
+                        col['text'] = target['text']
+                    row_doc.setdefault('columns', {})[hname] = col
+                if row_doc.get('columns'):
+                    rows.append(row_doc)
+                else:
+                    report.append({'level': 'info',
+                                   'type': 'no_fillable_col',
+                                   'row': kt,
+                                   'message': f'行 "{kt}" 没有可填列 '
+                                              f'(如检查要求说明行), 不进 rows'})
+
+    # ---- by_label 兜底: 表尾 label 角色格 (检查结论/审核人 等) ----
+    registered = {e['cell'] for lst in by_label.values() for e in lst}
+    for c in cells:
+        if c.get('role') != 'label' or not c.get('addr'):
+            continue
+        u = ref(c)
+        if u in registered:
+            continue
+        right = by_grid.get((c['row'], c['col'] + c.get('colspan', 1)))
+        value_u = None
+        if right is not None and right.get('addr'):
+            value_u = ref(right)
+            if (right.get('text') or '').strip():
+                idx_cells[value_u]['mode'] = 'replace'
+                idx_cells[value_u]['placeholder'] = \
+                    (right.get('text') or '').strip()
+                report.append({
+                    'level': 'info', 'type': 'placeholder_fill',
+                    'field': norm(c.get('text')), 'cell': value_u,
+                    'addr': right['addr'],
+                    'placeholder': (right.get('text') or '').strip(),
+                    'mode': 'replace',
+                    'message': f'"{norm(c.get("text"))}" 值格含占位文本, '
+                               f'按 replace 填充'})
+        add_label(c, value_u)
+
+    # fields 里尚未登记的标签 (审核日期/监理单位/编号 等非 label 角色,
+    # label 可能是格子也可能是游离文字)
+    for f in data.get('fields') or []:
+        label_ent = find_ent(f.get('label'))
+        if label_ent is None:
+            continue
+        u = ref(label_ent)
+        if u in {e['cell'] for lst in by_label.values() for e in lst}:
+            continue
+        value_u = None
+        value_ent = find_ent(f.get('value'))
+        if value_ent is not None and f.get('value') != f.get('label'):
+            value_u = ref(value_ent)
+        elif value_ent is not None:
+            value_u = u  # label/value 同格 (inline/append)
+        # 以字段名 (而非 label 格全文) 登记, 游离文字 label 的全文
+        # 可能含多个字段 (如 A3 一整行)
+        key = norm(f['name'])
+        ent = by_label.setdefault(key, [])
+        if not any(x['cell'] == u for x in ent):
+            x = {'cell': u}
+            if value_u:
+                x['value'] = value_u
+            ent.append(x)
+
+    data['index'] = {
+        'meta': {'title': (data.get('form') or {}).get('meta', {})
+                 .get('title'),
+                 'dpi': data.get('dpi'), 'width': data.get('width'),
+                 'height': data.get('height'),
+                 'header_row': header_row,
+                 'norm': '去除所有空白字符'},
+        'header_fields': header_fields,
+        'rows': rows,
+        'by_label': by_label,
+        'cells': idx_cells,
+        'report': report,
+    }
+    print(f"index: header_fields {len(header_fields)} 个, rows {len(rows)}"
+          f" 行, by_label {len(by_label)} 项, 报告 {len(report)} 条")
+
+
 # ---------------------------------------------------------------------------
 # 前端代码生成 (数据驱动: data.json + index.html)
 # ---------------------------------------------------------------------------
@@ -2320,14 +2818,19 @@ def extract_fields(data):
 def generate_frontend(data, out_dir):
     """把标准 JSON 落成前端产物:
 
-    data.json   表格结构化数据(几何 + 边框有无 + 文字), 供前端/程序消费
+    form.json   完整 JSON (含 form 可索引视图), 转换的直接产物,
+                建索引/回填/还原都以它为准
+    data.json   同一份内容的原名, 兼容已有消费方
     data.js     同一份数据包成 window.TABLE_DATA, 供 index.html 以 file:// 打开
+    template.json  前端 Template 结构 (背景图 + 字段覆盖层), Vue 复现层消费,
+                由 build_template 生成, 见 build_template docstring
     index.html  纯渲染层: 读数据, 为每个格子生成绝对定位的 div,
                 几何与原图像素一一对应, 边框只在原图有线处绘制。
     """
     json_text = json.dumps(data, ensure_ascii=False, indent=2)
-    with open(os.path.join(out_dir, 'data.json'), 'w', encoding='utf-8') as f:
-        f.write(json_text)
+    for name in ('form.json', 'data.json'):
+        with open(os.path.join(out_dir, name), 'w', encoding='utf-8') as f:
+            f.write(json_text)
     with open(os.path.join(out_dir, 'data.js'), 'w', encoding='utf-8') as f:
         f.write(f'window.TABLE_DATA = {json_text};\n')
 
@@ -2659,6 +3162,206 @@ def extract_page(input_path, page, args, diagnostics=True):
     return data
 
 
+def convert_document(input_path, out_dir, args):
+    """docx/xlsx 完整转换流水线 (main 与 server 共用)。
+
+    优先用本机 WPS/Office 排版引擎 100% 原样转 PDF, 走电子档通路;
+    失败才回退到 python-docx/openpyxl 的简化排版。
+    依次产出: form.json/data.json/data.js/index.html (generate_frontend)
+    和 rebuilt.pdf。返回 (data, office_pdf, pdf_path): office_pdf 是
+    排版引擎转出的原样 PDF (无 WPS/Office 时为 None)。
+    """
+    ext = os.path.splitext(input_path)[1].lower()
+    conv = None if args.no_office else office_to_pdf(input_path, out_dir)
+    if conv:
+        fitz = _import_pymupdf()
+        doc = fitz.open(conv)
+        n_pages = len(doc)
+        doc.close()
+        pages = [extract_page(conv, p, args, diagnostics=(p == 0))
+                 for p in range(n_pages)]
+        if ext == '.xlsx':
+            # 语义对齐: 逐页把探测网格锚定到原生 workbook,
+            # 给格子/游离文字赋稳定地址 addr (stitch 只平移 x, 先行列号不变)
+            try:
+                import openpyxl
+                wb_f = openpyxl.load_workbook(input_path)
+                wb_v = openpyxl.load_workbook(input_path, data_only=True)
+                for pg in pages:
+                    augment_xlsx_semantics(pg, wb_f, wb_v)
+            except ImportError:
+                print('未安装 openpyxl, 跳过语义对齐')
+            # 宽表被分页: 先横向拼回一整张, 再在数据层等比缩放到
+            # A4 页宽 (纯数学缩放, 相对位置严格不变)
+            data = stitch_page_data(pages)
+            if data['width'] > pages[0]['width']:
+                s = pages[0]['width'] / data['width']
+                data = scale_data(data, s)
+                print(f'按 A4 页宽等比缩放到 {s:.0%}')
+        else:
+            data = pages[args.page] if args.page < n_pages else pages[0]
+    else:
+        data = (docx_to_data(input_path) if ext == '.docx'
+                else xlsx_to_data(input_path))
+    assign_roles(data)
+    extract_fields(data)
+    build_form_view(data)
+    build_index(data)
+    generate_frontend(data, out_dir)
+    pdf_path = json_to_pdf(data, os.path.join(out_dir, 'rebuilt.pdf'))
+    return data, conv, pdf_path
+
+
+def _font_family(name):
+    """归一化字体名: 去 PDF 子集前缀 (ABCDEE+SimSun), 中文名映射英文，
+    对齐前端 fonts.ts 的 documentFonts 候选。"""
+    if not name:
+        return None
+    name = str(name).split('+')[-1].strip()
+    return _FONT_ALIASES.get(name, name)
+
+
+_FONT_ALIASES = {
+    '宋体': 'SimSun', '黑体': 'SimHei', '微软雅黑': 'Microsoft YaHei',
+    '仿宋': 'FangSong', '楷体': 'KaiTi', '等线': 'DengXian',
+    'ArialMT': 'Arial', 'TimesNewRomanPSMT': 'Times New Roman',
+}
+
+
+def _field_style(e, size):
+    """index.cells 实体 -> 前端 FieldStyle (字体/字号/颜色/对齐)。"""
+    style = {'fontSizePt': size,
+             'horizontalAlign': e.get('align') or 'center',
+             'verticalAlign': 'center'}
+    fam = _font_family(e.get('font'))
+    if fam:
+        style['fontFamily'] = fam
+    if e.get('color'):
+        style['color'] = e['color']
+    if e.get('bold'):
+        style['bold'] = True
+    return style
+
+
+def build_template(data, out_dir, source_paths=(), fallback_pdf=None,
+                   name=None, bg_url='background.png'):
+    """生成前端 Template JSON (template.json) + 背景图 background.png。
+
+    前端复现采用"背景图 + 字段覆盖层"混合方案 (frontend TemplatePage.vue):
+    - 背景图: pymupdf 把排版引擎的原样 PDF (office 转换件; 几何不匹配时
+      退到 rebuilt.pdf) 按 2px/pt 栅格化成 background.png,
+      "原样张"视觉上由它保证;
+    - 字段层: index.cells 的每一格变成一个 Field, rect 为占页宽/页高的
+      比例坐标, fieldUuid 即索引 uuid —— header_fields/rows/by_label
+      的 value 引用同一 uuid, 前端回填定位零换算; 识别文字进 label
+      (不做覆盖层重画, 视觉以背景图为唯一真相, 覆盖层只在填值时出现)。
+    page.width/height 用背景图像素尺寸 (2px/pt 栅格的宽/高), 不是 PDF 点:
+    前端字号公式 fontSizePt*2/page.width*100cqw (TemplatePage.vue) 和
+    PrintPreview 的 page.width/2*25.4/72 (mm) 都按这个约定消费。
+    无 index 的通路 (图片/PDF) 退化为逐格生成 Field。
+    """
+    import uuid as _uuid
+    fitz = _import_pymupdf()
+    dpi = data.get('dpi') or 300
+    pt_w = data['width'] * 72.0 / dpi
+    pt_h = data['height'] * 72.0 / dpi
+
+    # 背景源: 逐个候选试, 几何 (页面点大小) 与 data 一致才采用
+    bg_path = os.path.join(out_dir, 'background.png')
+    used_src = None
+    bg_wh = None
+    for cand in list(source_paths) + ([fallback_pdf] if fallback_pdf else []):
+        if not cand or not os.path.exists(cand):
+            continue
+        doc = None
+        try:
+            doc = fitz.open(cand)
+            if len(doc) >= 1:
+                p = doc[0]
+                if abs(p.rect.width - pt_w) <= max(2.0, pt_w * 0.02) and \
+                        abs(p.rect.height - pt_h) <= max(2.0, pt_h * 0.02):
+                    pix = p.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                    pix.save(bg_path)
+                    used_src = cand
+                    bg_wh = (pix.width, pix.height)
+        except Exception:
+            pass
+        finally:
+            if doc is not None:
+                doc.close()
+        if used_src:
+            break
+
+    # 字段层: index.cells -> Field (uuid/几何/文本/样式与索引一致)
+    ns = _INDEX_NS or _uuid.UUID('7d4f2a90-3b1c-5e6a-9f08-2d5b8c4a7e91')
+    idx_cells = ((data.get('index') or {}).get('cells')) or {}
+    W, H = data['width'], data['height']
+    fields = []
+    for u, e in idx_cells.items():
+        x, y, w, h = e['x'], e['y'], e['w'], e['h']
+        size = e.get('size') or 10
+        if (not w or not h) and e.get('text'):
+            # 游离文字实体: 无框, 宽按字数估算, 基线坐标 -> 框顶
+            n = len(''.join(str(e['text']).split()))
+            w = w or n * size * dpi / 72.0
+            h = h or size * dpi / 72.0 * 1.4
+            y = y - h * 0.85
+        w = min(w, W)
+        h = min(h, H)
+        x = max(0.0, min(x, W - w))
+        y = max(0.0, min(y, H - h))
+        f = {'fieldUuid': u,
+             'rect': {'x': round(x / W, 6), 'y': round(y / H, 6),
+                      'w': round(w / W, 6), 'h': round(h / H, 6)},
+             'style': _field_style(e, size)}
+        if e.get('text'):
+            # 识别文字进 label (区域属性/列表里可见), 不进 textOverride:
+            # textOverride 会触发白底覆盖层重画, DOM 字 metrics/对齐是
+            # 估算值, 叠在像素级背景上反而显假; 视觉以背景图为唯一真相,
+            # 覆盖层只在运行时填值 (previewValues) 时出现
+            f['label'] = e['text']
+        fields.append(f)
+    if not fields:  # 无 index (图片/PDF 通路): 逐格退化生成
+        for i, c in enumerate(data.get('cells') or []):
+            a = c.get('addr') or f'#C{i}'
+            f = {'fieldUuid': str(_uuid.uuid5(ns, a)),
+                 'rect': {'x': round(c['x'] / W, 6),
+                          'y': round(c['y'] / H, 6),
+                          'w': round(c['w'] / W, 6),
+                          'h': round(c['h'] / H, 6)},
+                 'style': _field_style(c, round(c.get('size') or 10, 2))}
+            if c.get('text'):
+                f['label'] = c['text']
+            fields.append(f)
+
+    form_meta = ((data.get('form') or {}).get('meta')) or {}
+    tpl_name = (name or form_meta.get('title') or '未命名表单')
+    ext = os.path.splitext(os.path.basename(used_src or ''))[1]
+    template = {
+        'templateUuid': str(_uuid.uuid5(ns, 'template:' + tpl_name)),
+        'name': tpl_name,
+        'version': 1,
+        'sourceFormat': (ext.lstrip('.') if used_src
+                         else os.path.splitext(os.path.basename(
+                             fallback_pdf or ''))[1].lstrip('.') or 'data'),
+        'pages': [{
+            'pageUuid': str(_uuid.uuid5(ns, 'page:' + tpl_name)),
+            'pageNo': 1,
+            # 背景像素尺寸 (无背景时按 2px/pt 折算, 保持同一约定)
+            'width': bg_wh[0] if bg_wh else round(pt_w * 2, 2),
+            'height': bg_wh[1] if bg_wh else round(pt_h * 2, 2),
+            'background': bg_url if used_src else '',
+            'fields': fields,
+        }],
+    }
+    tpl_path = os.path.join(out_dir, 'template.json')
+    with open(tpl_path, 'w', encoding='utf-8') as f:
+        json.dump(template, f, ensure_ascii=False, indent=2)
+    print(f'前端模板: {tpl_path} (字段 {len(fields)} 个, 背景 '
+          f'{os.path.basename(used_src) if used_src else "无"})')
+    return tpl_path
+
+
 def main():
     ap = argparse.ArgumentParser(
         description='图片/PDF/Word/Excel 表格提取与还原')
@@ -2698,49 +3401,17 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     ext = os.path.splitext(args.input)[1].lower()
+    stem = os.path.splitext(os.path.basename(args.input))[0]
     if ext in ('.docx', '.xlsx'):
-        # 优先用本机 WPS/Office 排版引擎 100% 原样转 PDF, 走电子档通路;
-        # 失败才回退到 python-docx/openpyxl 的简化排版
-        conv = None if args.no_office else office_to_pdf(args.input, args.out)
-        if conv:
-            fitz = _import_pymupdf()
-            doc = fitz.open(conv)
-            n_pages = len(doc)
-            doc.close()
-            pages = [extract_page(conv, p, args, diagnostics=(p == 0))
-                     for p in range(n_pages)]
-            if ext == '.xlsx':
-                # 语义对齐: 逐页把探测网格锚定到原生 workbook,
-                # 给格子/游离文字赋稳定地址 addr (stitch 只平移 x, 先行列号不变)
-                try:
-                    import openpyxl
-                    wb_f = openpyxl.load_workbook(args.input)
-                    wb_v = openpyxl.load_workbook(args.input,
-                                                  data_only=True)
-                    for pg in pages:
-                        augment_xlsx_semantics(pg, wb_f, wb_v)
-                except ImportError:
-                    print('未安装 openpyxl, 跳过语义对齐')
-                # 宽表被分页: 先横向拼回一整张, 再在数据层等比缩放到
-                # A4 页宽 (纯数学缩放, 相对位置严格不变)
-                data = stitch_page_data(pages)
-                if data['width'] > pages[0]['width']:
-                    s = pages[0]['width'] / data['width']
-                    data = scale_data(data, s)
-                    print(f'按 A4 页宽等比缩放到 {s:.0%}')
-            else:
-                data = pages[args.page] if args.page < n_pages else pages[0]
-        else:
-            data = (docx_to_data(args.input) if ext == '.docx'
-                    else xlsx_to_data(args.input))
-        assign_roles(data)
-        extract_fields(data)
-        index_path = generate_frontend(data, args.out)
-        pdf_path = json_to_pdf(data, os.path.join(args.out, 'rebuilt.pdf'))
+        data, office_pdf, pdf_path = convert_document(args.input, args.out,
+                                                      args)
+        build_template(data, args.out, source_paths=[office_pdf],
+                       fallback_pdf=pdf_path, name=stem)
         print(f'格子 {len(data["cells"])} 个, '
               f'段落 {len(data["texts"])} 行, 线段 {len(data["rules"])} 条')
         print(f'还原 PDF: {pdf_path} (数据源: data.json)')
-        print(f'前端代码: {index_path} (数据: data.json / data.js)')
+        print(f'前端代码: {os.path.join(args.out, "index.html")} '
+              f'(数据: data.json / data.js / template.json)')
         return
 
     data = extract_page(args.input, args.page, args)
@@ -2748,6 +3419,9 @@ def main():
     if data:
         index_path = generate_frontend(data, args.out)
         pdf_path = json_to_pdf(data, os.path.join(args.out, 'rebuilt.pdf'))
+        build_template(data, args.out,
+                       source_paths=[args.input] if ext == '.pdf' else [],
+                       fallback_pdf=pdf_path, name=stem)
     if pdf_path:
         print(f'还原 PDF: {pdf_path} (数据源: data.json)')
     if index_path:
