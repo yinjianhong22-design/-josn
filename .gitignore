@@ -1,0 +1,11 @@
+# 虚拟环境与缓存
+.venv/
+__pycache__/
+*.pyc
+
+# 密钥/令牌缓存
+.baidu_token_cache.json
+
+# 生成产物 (可由 extract_grid.py 重新生成)
+grid_out/
+_tmp_form/
