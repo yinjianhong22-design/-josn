@@ -11,3 +11,6 @@ grid_out/
 _tmp_form/
 out/
 _uploads/
+
+# Office/WPS 锁文件
+~$*
