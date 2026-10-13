@@ -65,11 +65,6 @@ def _convert_args():
     return argparse.Namespace(
         page=0, dpi=300, h_ratio=0.1, v_ratio=0.03, h_min_span=0.28,
         v_min_span=0.04, no_ocr=False, force_ocr=False, no_office=False,
-        paddle_url=os.environ.get('PADDLE_OCR_URL'),
-        paddle_token=os.environ.get('PADDLE_OCR_TOKEN'),
-        baidu_ak=os.environ.get('BAIDU_OCR_AK'),
-        baidu_sk=os.environ.get('BAIDU_OCR_SK'),
-        baidu_api='accurate_basic',
         out=None, input=None, h_ratio_set=None)
 
 

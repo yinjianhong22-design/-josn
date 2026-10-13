@@ -23,7 +23,7 @@ cells 表带几何与填充 mode (overwrite/replace/append/inline), 边界情况
 回填契约: 按 addr 找到格子, 改 text、删 lines, 几何与边框不动。
 
 用法:
-    python extract_grid.py input.png [-o out_dir] [--baidu-ak ... --baidu-sk ...]
+    python extract_grid.py input.png [-o out_dir]
     python extract_grid.py input.pdf [--page 0] [--dpi 300]
     python extract_grid.py input.docx | input.xlsx
 
@@ -923,156 +923,12 @@ def ocr_cells(img, cells, inset=4):
     return texts
 
 
-def ocr_cells_paddle(img, cells, url, token, inset=4):
-    """逐格 OCR (PaddleOCR 官方 API / PP-OCRv5+): 每格裁图后单独请求。
-
-    API_URL 与 token 在 https://aistudio.baidu.com/paddleocr/task 的
-    "API 调用示例" 中获取。返回 {(row,col): 文本}; 网络失败返回 None。
-    """
-    import base64
-
-    import requests
-
-    headers = {'Authorization': f'token {token}',
-               'Content-Type': 'application/json'}
-    texts = {}
-    for idx, c in enumerate(cells):
-        crop = _prepare_crop(img, c, inset)
-        if crop is None:
-            continue
-        b64 = base64.b64encode(cv2.imencode('.png', crop)[1]).decode('ascii')
-        payload = {
-            'file': b64, 'fileType': 1, 'visualize': False,
-            'useDocOrientationClassify': False,
-            'useDocUnwarping': False,
-            'useTextlineOrientation': False,
-        }
-        try:
-            r = requests.post(url, json=payload, headers=headers, timeout=120)
-            r.raise_for_status()
-            body = r.json()
-        except Exception as e:
-            print(f'  格[{c["row"]},{c["col"]}] OCR 请求失败: {e}')
-            continue
-        if body.get('errorCode', 0) != 0:
-            print(f'  格[{c["row"]},{c["col"]}] OCR 报错: {body.get("errorMsg")}')
-            continue
-        results = body.get('result', {}).get('ocrResults') or []
-        if not results:
-            continue
-        pr = results[0].get('prunedResult', {})
-        rec_texts = pr.get('rec_texts') or []
-        polys = pr.get('rec_polys') or pr.get('dt_polys') or []
-        # 按文本框纵向位置排序后拼接
-        items = []
-        for k, t in enumerate(rec_texts):
-            y = float(np.mean([p[1] for p in polys[k]])) if k < len(polys) \
-                else float(k)
-            items.append((y, t))
-        if items:
-            texts[(c['row'], c['col'])] = '\n'.join(
-                t for _, t in sorted(items))
-        print(f'  格[{c["row"]},{c["col"]}] ({idx + 1}/{len(cells)}) 完成')
-    return texts
-
-
-def _baidu_token(ak, sk):
-    """用 AK/SK 换 access_token (30 天有效), 缓存到本地文件避免重复请求。"""
-    import time
-
-    import requests
-
-    cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              '.baidu_token_cache.json')
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, encoding='utf-8') as f:
-                cache = json.load(f)
-            if cache.get('ak') == ak and cache.get('expires', 0) > time.time():
-                return cache['token']
-        except Exception:
-            pass
-    r = requests.get('https://aip.baidubce.com/oauth/2.0/token',
-                     params={'grant_type': 'client_credentials',
-                             'client_id': ak, 'client_secret': sk},
-                     timeout=30)
-    d = r.json()
-    token = d.get('access_token')
-    if not token:
-        raise RuntimeError(f'百度 access_token 获取失败: {d}')
-    with open(cache_path, 'w', encoding='utf-8') as f:
-        # 官方有效期 30 天, 缓存提前 1 天失效
-        json.dump({'ak': ak, 'token': token,
-                   'expires': time.time() + d.get('expires_in', 2592000) - 86400},
-                  f)
-    return token
-
-
-def ocr_cells_baidu(img, cells, ak, sk, api='accurate_basic', inset=4):
-    """逐格 OCR (百度智能云文字识别): 每格裁图后单独请求。
-
-    AK/SK 在百度智能云文字识别控制台的应用列表中获取。
-    api 可选 accurate_basic(高精度,默认)/general_basic/handwriting 等。
-    返回 {(row,col): 文本}。
-    """
-    import base64
-    import time
-
-    import requests
-
-    token = _baidu_token(ak, sk)
-    url = f'https://aip.baidubce.com/rest/2.0/ocr/v1/{api}'
-    texts = {}
-    for idx, c in enumerate(cells):
-        crop = _prepare_crop(img, c, inset)
-        if crop is None:
-            continue
-        b64 = base64.b64encode(cv2.imencode('.png', crop)[1]).decode('ascii')
-        body = None
-        for attempt in range(3):
-            try:
-                r = requests.post(
-                    url, params={'access_token': token}, data={'image': b64},
-                    headers={'Content-Type':
-                             'application/x-www-form-urlencoded'},
-                    timeout=60)
-                body = r.json()
-            except Exception as e:
-                print(f'  格[{c["row"]},{c["col"]}] OCR 请求失败: {e}')
-                break
-            code = body.get('error_code', 0)
-            if code == 0:
-                break
-            if code in (17, 18, 19):      # 限流/配额错误, 等待重试
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            print(f'  格[{c["row"]},{c["col"]}] OCR 报错: '
-                  f'{body.get("error_code")} {body.get("error_msg")}')
-            break
-        if body and body.get('error_code', 0) == 0:
-            words = [w['words'] for w in body.get('words_result', [])]
-            if words:
-                texts[(c['row'], c['col'])] = '\n'.join(words)
-        time.sleep(0.35)  # 免费额度 QPS 有限, 控制节奏
-        print(f'  格[{c["row"]},{c["col"]}] ({idx + 1}/{len(cells)}) 完成')
-    return texts
-
-
 def _pick_ocr_backend(args):
-    """按命令行参数选择 OCR 后端, 返回 (名称, (img, cells) -> dict)。
+    """OCR 后端: 本地 RapidOCR 逐格识别, 返回 (名称, (img, cells) -> dict)。
 
-    云端优先: PaddleOCR API > 百度智能云 > 本地 RapidOCR;
-    扫描件/图片的格子文字由选中的后端逐格识别。
+    未安装 rapidocr-onnxruntime 时 ocr_cells 返回 None (跳过文字识别,
+    只还原结构): pip install rapidocr-onnxruntime
     """
-    if args.paddle_url and args.paddle_token:
-        return ('PaddleOCR API',
-                lambda img, cl: ocr_cells_paddle(img, cl, args.paddle_url,
-                                                 args.paddle_token))
-    if args.baidu_ak and args.baidu_sk:
-        return (f'百度智能云文字识别 ({args.baidu_api})',
-                lambda img, cl: ocr_cells_baidu(img, cl, args.baidu_ak,
-                                                args.baidu_sk,
-                                                api=args.baidu_api))
     return 'RapidOCR (本地)', ocr_cells
 
 
@@ -1147,10 +1003,9 @@ def build_table_data(cells, texts, horiz_c, vert_c, dpi, img_size,
       texts  表格线框外的游离文字(页眉/标题/页码等), 带基线坐标和字号(pt)
       rules  电子档 PDF 的原始矢量线段(精确坐标+线宽); 有 rules 时渲染层
              直接画 rules, 不再按格子边逐边描绘(避免重复/偏移)
+    0 个格子(拍照件/无线表格)也返回合法结构: 只有游离文字,
+    下游照常出背景/模板, 不再返回 None 让调用方 500。
     """
-    if not cells:
-        return None
-
     def edges(c):
         tl = (c['x'], c['y'])
         tr = (c['x'] + c['w'], c['y'])
@@ -3113,9 +2968,7 @@ def extract_page(input_path, page, args, diagnostics=True):
             ocr_res = backend(img, cells)
             if ocr_res is None:
                 print('未安装 rapidocr-onnxruntime, 跳过文字识别'
-                      ' (pip install rapidocr-onnxruntime);'
-                      ' 或用 --baidu-ak/--baidu-sk'
-                      ' / --paddle-url/--paddle-token 走云端 OCR')
+                      ' (pip install rapidocr-onnxruntime)')
             else:
                 texts = ocr_res
                 # 投影行切分对位: 约束每行文字还原时的字号和位置
@@ -3369,6 +3222,20 @@ def build_template(data, out_dir, source_paths=(), fallback_pdf=None,
             h = h or size * dpi / 72.0 * 1.4
             y = y - h * 0.85
         _emit(u, x, y, w, h, e, e.get('text'), e.get('addr'))
+    # 渲染层游离文字 (标题/页眉/拍照件整页文字) 也生成字段:
+    # 拍照件没有格子, 文字字段就是全部可点区域
+    for i, t in enumerate(data.get('texts') or []):
+        a = t.get('addr')
+        u = str(_uuid.uuid5(ns, a)) if a else str(
+            _uuid.uuid5(ns, f'#T{i}'))
+        if u in seen:
+            continue
+        size = t.get('size') or 10
+        txt = (t.get('text') or '').strip()
+        n = len(''.join(txt.split()))
+        w = n * size * dpi / 72.0
+        h = size * dpi / 72.0 * 1.4
+        _emit(u, t['x'], t['y'] - h * 0.85, w, h, dict(t), txt or None, a)
 
     form_meta = ((data.get('form') or {}).get('meta')) or {}
     tpl_name = (name or form_meta.get('title') or '未命名表单')
@@ -3420,18 +3287,6 @@ def main():
     ap.add_argument('--no-office', action='store_true',
                     help='docx/xlsx 不调用本机 WPS/Office 转 PDF, '
                          '直接用 python-docx/openpyxl 简化排版')
-    ap.add_argument('--paddle-url', default=os.environ.get('PADDLE_OCR_URL'),
-                    help='PaddleOCR API 地址 (或设环境变量 PADDLE_OCR_URL), '
-                         '在 aistudio.baidu.com/paddleocr/task 获取')
-    ap.add_argument('--paddle-token', default=os.environ.get('PADDLE_OCR_TOKEN'),
-                    help='PaddleOCR API token (或设环境变量 PADDLE_OCR_TOKEN)')
-    ap.add_argument('--baidu-ak', default=os.environ.get('BAIDU_OCR_AK'),
-                    help='百度智能云文字识别 API Key (或环境变量 BAIDU_OCR_AK)')
-    ap.add_argument('--baidu-sk', default=os.environ.get('BAIDU_OCR_SK'),
-                    help='百度智能云文字识别 Secret Key (或环境变量 BAIDU_OCR_SK)')
-    ap.add_argument('--baidu-api', default='accurate_basic',
-                    choices=['accurate_basic', 'general_basic', 'handwriting'],
-                    help='百度 OCR 接口 (默认 accurate_basic 高精度版)')
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -3456,7 +3311,8 @@ def main():
         index_path = generate_frontend(data, args.out)
         pdf_path = json_to_pdf(data, os.path.join(args.out, 'rebuilt.pdf'))
         build_template(data, args.out,
-                       source_paths=[args.input] if ext == '.pdf' else [],
+                       source_paths=([args.input] if ext == '.pdf' or
+                                     ext in _IMG_EXT else []),
                        fallback_pdf=pdf_path, name=stem)
     if pdf_path:
         print(f'还原 PDF: {pdf_path} (数据源: data.json)')

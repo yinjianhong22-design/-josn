@@ -835,7 +835,7 @@ onMounted(() => refresh().catch(() => { error.value = '无法连接文档服务�
     <header class="appbar">
       <img class="app-logo" src="/logo.png" alt="SDIG" />
       <div class="app-actions">
-        <button class="text-button" :disabled="busy" title="文件页面会发送至 PaddleOCR 云端识别" @click="input?.click()">导入文档</button>
+        <button class="text-button" :disabled="busy" title="扫描件/图片由本地 OCR (RapidOCR) 逐格识别" @click="input?.click()">导入文档</button>
         <button class="text-button" :disabled="!template || busy" @click="printOpen = true">打印预览</button>
         <button class="text-button" :disabled="!template" @click="jsonOpen = true">JSON</button>
         <button class="primary" :disabled="!template || busy || saved" @click="save">{{ saved ? '已保存' : '保存模板' }}</button>
@@ -893,7 +893,7 @@ onMounted(() => refresh().catch(() => { error.value = '无法连接文档服务�
             <div v-if="sampleUrl" class="sample-artboard" :style="{ width: (794 * zoom / 100) + 'px' }"><div class="artboard-label sample-artboard-label"><span>样例图片</span><span :title="sampleName">{{ sampleName }}</span></div><SourceSample :url="sampleUrl" :sample="sampleResult" :mapping="currentMapping" :picking="picking" :selected-ids="sourceTextIds" @text="chooseSourceText" @area="chooseSource({rect:$event})" /></div>
             <div class="page-wrap" :style="{ width: (794 * zoom / 100) + 'px' }"><div class="artboard-label">{{ sampleUrl ? '目标模板 · ' : '' }}页面 {{ page.pageNo }}</div><div class="page-viewport" :style="{ height: (794 * zoom / 100 * page.height / page.width) + 'px' }"><TemplatePage :style="{ width: '794px', transform: `scale(${zoom / 100})`, transformOrigin: 'top left' }" :preview-values="trialValues" :page="page" :selected-ids="selectedIds" :show-regions="showRegions" :show-background="showBackground" :split-guide="splitDraft" @select="selectField" @resize="resizeField" @split-move="updateSplitPosition" /></div></div>
           </div>
-          <div v-else class="empty-canvas"><RiBrushAiLine aria-hidden="true" /><p>拖入文件开始编辑</p><button class="secondary" :disabled="busy" @click="input?.click()">导入文档</button><p class="cloud-note">页面图像会发送至 PaddleOCR 云端识别</p></div>
+          <div v-else class="empty-canvas"><RiBrushAiLine aria-hidden="true" /><p>拖入文件开始编辑</p><button class="secondary" :disabled="busy" @click="input?.click()">导入文档</button><p class="cloud-note">扫描件/图片由本地 OCR (RapidOCR) 识别</p></div>
         </div>
         <div class="canvas-tools" aria-label="画布工具">
           <button class="tool-button" :class="{ active: tool === 'select' }" aria-label="选择工具" :aria-pressed="tool === 'select'" title="选择" @click="tool = 'select'"><RiSendPlaneLine class="flip-x" aria-hidden="true" /></button>
