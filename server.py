@@ -6,6 +6,8 @@
     POST /templates/{id}/save       保存前端编辑后的 Template JSON
     DELETE /templates/{id}          删除模板文件
     POST /upload                    上传 xlsx/docx/pdf, 跑转换管线, 返回模板
+    POST /match-sheet               上传数据简表, 按 表名/编号 自动路由模板
+                                    并匹配回填, 返回 templateUuid + values
 静态:
     /        Vue 前端 (dist/, 未构建时提示)
     /files/  项目根目录 (转换输出目录的背景图等, template.json 里的
@@ -43,7 +45,22 @@ def scan_templates(root):
         try:
             with open(path, encoding='utf-8') as f:
                 tpl = json.load(f)
-            _registry[tpl['templateUuid']] = path
+            tid = tpl['templateUuid']
+            if tid in _registry:
+                # 同名模板多处产出 (CLI grid_out 与服务端 out/), 优先保留
+                # form.json 带 index 的 (回填能力完整)
+                def has_index(p):
+                    try:
+                        with open(os.path.join(os.path.dirname(p),
+                                               'form.json'),
+                                  encoding='utf-8') as f:
+                            return bool(json.load(f).get('index'))
+                    except Exception:
+                        return False
+                if not has_index(_registry[tid]) and has_index(path):
+                    _registry[tid] = path
+            else:
+                _registry[tid] = path
         except Exception as e:
             print(f'[scan] 跳过 {path}: {e}')
 
@@ -66,6 +83,119 @@ def _convert_args():
         page=0, dpi=300, h_ratio=0.1, v_ratio=0.03, h_min_span=0.28,
         v_min_span=0.04, no_ocr=False, force_ocr=False, no_office=False,
         out=None, input=None, h_ratio_set=None)
+
+
+def _route_template(sheet):
+    """按 表名/编号 给注册表里的模板打分, 返回 (tid, score) 最高者。
+
+    表名完全相等 +10 / 互相包含 +5; 编号 (从 '编 号:JB12-4.5.2-4'
+    类文本提取代码) 相等 +10 / 前缀家族 +3。编号在数据简表上是逐记录
+    流水, 与模板印刷编号不一定全等, 所以表名是主键、编号是辅键。"""
+    import re
+
+    def norm(s):
+        s = str(s or '').translate({ord('（'): '(', ord('）'): ')'})
+        return re.sub(r'\s+', '', s)
+
+    def code_of(text):
+        m = re.search(r'编号\s*[::]\s*([A-Za-z0-9]+(?:[-.][A-Za-z0-9]+)*)',
+                      str(text or ''))
+        return m.group(1) if m else None
+
+    title = norm(sheet.get('title'))
+    sheet_code = code_of((sheet.get('context') or {}).get('编号'))
+    best = None
+    for tid, path in _registry.items():
+        try:
+            with open(os.path.join(os.path.dirname(path), 'form.json'),
+                      encoding='utf-8') as f:
+                form = json.load(f)
+        except Exception:
+            continue
+        score = 0
+        t_title = norm((form.get('form') or {}).get('meta', {}).get('title'))
+        if title and t_title:
+            if title == t_title:
+                score += 10
+            elif len(title) >= 4 and (title in t_title or t_title in title):
+                score += 5
+        if sheet_code:
+            idx = form.get('index') or {}
+            hf = idx.get('header_fields') or {}
+            num_u = hf.get('编号')
+            num_u = num_u.get('cell') if isinstance(num_u, dict) else num_u
+            t_code = code_of(((idx.get('cells') or {}).get(num_u) or {})
+                             .get('text'))
+            if t_code:
+                if norm(sheet_code) == norm(t_code):
+                    score += 10
+                elif t_code.startswith(sheet_code) \
+                        or sheet_code.startswith(t_code):
+                    score += 3
+        if best is None or score > best[1]:
+            best = (tid, score)
+    return best
+
+
+async def _parse_sheet_upload(file, upload_dir):
+    """校验/暂存/解析数据简表上传, 返回 (sheet, 暂存路径)。
+
+    暂存文件保留 (前端左侧画板要拿它生成预览图)。"""
+    from fastapi import HTTPException
+    import extract_grid
+    stem, ext = os.path.splitext(file.filename or '')
+    if ext.lower() not in ('.xlsx', '.xls'):
+        raise HTTPException(400, '仅支持 .xlsx/.xls 数据简表')
+    os.makedirs(upload_dir, exist_ok=True)
+    tmp = os.path.join(upload_dir, f'sheet_{os.getpid()}{ext}')
+    with open(tmp, 'wb') as f:
+        f.write(await file.read())
+    sheet = extract_grid.parse_data_sheet(tmp)
+    if not sheet['fields']:
+        raise HTTPException(400,
+                            '未能从简表解析出字段 '
+                            '(需要 项目/规定值/实测值 类表头)')
+    return sheet, tmp
+
+
+_IMG_EXT = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
+
+
+def _sheet_preview_url(path, upload_dir):
+    """给上传的数据简表生成左侧预览图, 返回 /files/... URL 或 None。
+
+    图片直接复用; xlsx 走 WPS->PDF->PNG。按内容哈希缓存, 重复匹配不重复
+    转换。失败静默返回 None (前端回退到模板原图)。"""
+    import hashlib
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        digest = hashlib.md5(open(path, 'rb').read()).hexdigest()[:8]
+        if ext in _IMG_EXT:
+            dst = os.path.join(upload_dir, f'sheet_preview_{digest}{ext}')
+            if not os.path.exists(dst):
+                import shutil
+                shutil.copy(path, dst)
+        else:
+            dst = os.path.join(upload_dir, f'sheet_preview_{digest}.png')
+            if not os.path.exists(dst):
+                import extract_grid
+                pdf = extract_grid.office_to_pdf(path, upload_dir)
+                if not pdf:
+                    return None
+                fitz = extract_grid._import_pymupdf()
+                doc = fitz.open(pdf)
+                page = doc[0]
+                zoom = 1400 / max(page.rect.width, 1)
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                pix.save(dst)
+                doc.close()
+                os.remove(pdf)
+        rel = os.path.relpath(dst, os.path.dirname(upload_dir)) \
+            .replace(os.sep, '/')
+        return '/files/' + rel
+    except Exception as e:
+        print(f'[sheet-preview] 生成失败: {e}')
+        return None
 
 
 def convert_upload(src_path, stem, root, out_base):
@@ -163,6 +293,50 @@ def create_app(root=ROOT):
         if os.path.exists(path):
             os.remove(path)
         return {'ok': True}
+
+    @app.post('/templates/{tid}/match-sheet')
+    async def match_sheet(tid: str, file: UploadFile = File(...)):
+        """上传数据简表 (xlsx), 解析成一次性 JSON 并按指定模板索引匹配,
+        返回 {title, fields, values: {fieldUuid: 值}, unmatched}。
+        简表解析结果不落盘, 用完即弃。"""
+        import extract_grid
+        scan_templates(root)
+        path = _registry.get(tid)
+        if not path:
+            raise HTTPException(404, '模板不存在')
+        sheet, tmp = await _parse_sheet_upload(file, upload_dir)
+        with open(os.path.join(os.path.dirname(path), 'form.json'),
+                  encoding='utf-8') as f:
+            index = (json.load(f).get('index')) or {}
+        res = extract_grid.match_data_fields(sheet, index)
+        print(f"[match-sheet] title={sheet['title']} "
+              f"fields={len(sheet['fields'])} "
+              f"命中={len(res['values'])} 未匹配={res['unmatched']}")
+        return {**sheet, **res,
+                'sheetImage': _sheet_preview_url(tmp, upload_dir)}
+
+    @app.post('/match-sheet')
+    async def match_sheet_auto(file: UploadFile = File(...)):
+        """上传数据简表: 解析后按 表名/编号 自动路由模板库并匹配回填,
+        返回 {templateUuid, title, context, fields, values, unmatched}。"""
+        import extract_grid
+        sheet, tmp = await _parse_sheet_upload(file, upload_dir)
+        scan_templates(root)
+        routed = _route_template(sheet)
+        if not routed or routed[1] <= 0:
+            raise HTTPException(
+                404, f"没有匹配到模板 (简表表名: {sheet['title'] or '未识别'}, "
+                     f"请先在模板库制作/上传对应模板表)")
+        tid = routed[0]
+        with open(os.path.join(os.path.dirname(_registry[tid]), 'form.json'),
+                  encoding='utf-8') as f:
+            index = (json.load(f).get('index')) or {}
+        res = extract_grid.match_data_fields(sheet, index)
+        print(f"[match-sheet:auto] title={sheet['title']} -> {tid} "
+              f"score={routed[1]} 命中={len(res['values'])} "
+              f"未匹配={res['unmatched']}")
+        return {'templateUuid': tid, **sheet, **res,
+                'sheetImage': _sheet_preview_url(tmp, upload_dir)}
 
     @app.post('/upload')
     async def upload(file: UploadFile = File(...)):

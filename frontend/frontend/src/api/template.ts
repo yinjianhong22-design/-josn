@@ -23,6 +23,22 @@ export function uploadTemplate(file: File) {
   return request<{ template: Template }>('/upload', { method: 'POST', body })
 }
 
+export interface SheetMatchResult {
+  templateUuid: string
+  title: string | null
+  context: Record<string, string>
+  fields: Record<string, unknown>[]
+  values: Record<string, string>
+  unmatched: string[]
+}
+
+/** 上传数据简表: 后端按 表名/编号 自动路由模板并匹配回填 */
+export function autoMatchSheet(file: File) {
+  const body = new FormData()
+  body.append('file', file)
+  return request<SheetMatchResult>('/match-sheet', { method: 'POST', body })
+}
+
 export function recognizeSample(file: File, page: Page) {
   const body = new FormData(); body.append('file', file); body.append('page', JSON.stringify(page))
   return request<{sampleId:string}>('/samples/recognize', {method:'POST',body})

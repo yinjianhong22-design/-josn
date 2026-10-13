@@ -19,7 +19,8 @@ import { displayFieldValue } from '../utils/fieldValue'
 import { underlineRanges, rangeUnderlined, toggleRange, editedRanges } from '../utils/textUnderline'
 import { mergeBounds, mergeMasks } from '../utils/merge'
 import { documentFonts, fontKey, fontStack, namedFontSizes, pointFontSizes } from '../utils/fonts'
-import { imageUrl, listTemplates, loadTemplate, saveTemplate, uploadTemplate, recognizeSample, getSample, selectSample, correctSample, matchSample, deleteTemplate } from '../api/template'
+import { imageUrl, listTemplates, loadTemplate, saveTemplate, uploadTemplate, autoMatchSheet, recognizeSample, getSample, selectSample, correctSample, matchSample, deleteTemplate } from '../api/template'
+import type { SheetMatchResult } from '../api/template'
 import type { SupplementaryRegion, SupplementaryResult, SupplementaryRole, SupplementaryRecord, MappingRule, Field, FieldDefinition, FieldStyle, SampleResult, SourceMapping, Page, Rect, Template, TemplateSummary } from '../types/template'
 
 const template = ref<Template>()
@@ -127,6 +128,46 @@ function protectSupplementary(items:Field[]) {
 const businessFields = computed(() => template.value?.businessFields || [])
 const mappingFields = computed(() => fields.value.filter((field,index,array) => field.definition?.name.trim() && field.definition.imageRecognition && array.findIndex(other=>other.businessFieldUuid===field.businessFieldUuid)===index))
 const trialValues = computed(() => trial.value ? {...Object.fromEntries(fields.value.filter(field => field.definition?.imageRecognition && field.mapping?.sampleId === sampleResult.value?.sampleId && field.mapping?.confirmed && field.mapping.text && !field.mapping.warning).map(field => [field.fieldUuid, displayFieldValue(field.mapping!.text, field.definition?.dataType)])), ...supplementaryResult.value?.values} : undefined)
+// 数据简表: 匹配到的值直接填入字段 textOverride (可编辑文本), 不做临时覆盖层
+const sheetInput = ref<HTMLInputElement>()
+const sheetName = ref('')
+const sheetError = ref('')
+const sheetMatching = ref(false)
+const sheetResult = ref<SheetMatchResult>()
+let sheetFile: File | undefined  // 保留简表文件供"重新匹配"
+async function onSheetFile(event: Event) {
+  const file = (event.target as HTMLInputElement).files?.[0]
+  if (file) await runMatchSheet(file)
+  if (sheetInput.value) sheetInput.value.value = ''
+}
+async function runMatchSheet(file: File) {
+  if (sheetMatching.value) return
+  sheetMatching.value = true; sheetError.value = ''
+  try {
+    const result = await autoMatchSheet(file)
+    sheetResult.value = result
+    sheetName.value = file.name
+    sheetFile = file
+    // 按 表名/编号 自动路由: 与当前显示模板不一致时切换过去
+    if (template.value?.templateUuid !== result.templateUuid) {
+      await open(result.templateUuid)
+    }
+    // 填入字段: 值成为字段的可编辑文本, 与手工编辑同机制
+    let filled = 0
+    for (const pg of template.value?.pages || []) {
+      for (const f of [...(pg.fields || []), ...(pg.tables || []).flatMap(table => table.fields)]) {
+        const v = result.values[f.fieldUuid]
+        if (v !== undefined) {
+          if (f.textOverride !== v) { f.textOverride = v; filled++ }
+          else filled++
+        }
+      }
+    }
+    if (filled) saved.value = false
+    notice.value = `简表已填入 ${filled} 个值${result.unmatched.length ? `, ${result.unmatched.length} 项未匹配` : ''}, 点选字段可编辑`
+  } catch (e) { sheetError.value = (e as Error).message }
+  finally { sheetMatching.value = false }
+}
 function applySuggestions(suggestions: Record<string,SourceMapping>) {
   for(const field of fields.value) {
     const mapping=suggestions[field.fieldUuid]
@@ -832,6 +873,7 @@ onMounted(() => refresh().catch(() => { error.value = '无法连接文档服务�
   <div class="workspace" :inert="printOpen" @dragover.prevent @drop.prevent="drop">
     <input ref="sampleInput" class="file-input" type="file" accept="image/*" aria-label="上传样例图片文件" @change="showSample" />
     <input ref="input" class="file-input" type="file" accept=".pdf,.xlsx,.xls,.docx,.doc,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp" @change="onFile" />
+    <input ref="sheetInput" class="file-input" type="file" accept=".xlsx,.xls" aria-label="上传数据简表文件" @change="onSheetFile" />
     <header class="appbar">
       <img class="app-logo" src="/logo.png" alt="SDIG" />
       <div class="app-actions">
@@ -906,7 +948,7 @@ onMounted(() => refresh().catch(() => { error.value = '无法连接文档服务�
       <aside class="inspector">
         <div class="panel-tabs inspector-tabs" role="tablist" aria-label="区域配置"><button role="tab" :class="{ active: inspectorTab === 'properties' }" :aria-selected="inspectorTab === 'properties'" @click="inspectorTab = 'properties'">属性</button><button role="tab" :class="{ active: inspectorTab === 'data' }" :aria-selected="inspectorTab === 'data'" @click="inspectorTab = 'data'">数据</button></div>
         <SupplementaryPanel v-show="inspectorTab === 'data'" :page="page" :selected-fields="selectedFields" :result="supplementaryResult" :busy="recognizing || trialMatching || selectingSource" @configure="configureSupplementary" @remove-row="removeSupplementaryRow" @select-row="selectSupplementaryRow" @correct="correctSupplementary" @inspect="inspectSupplementary" />
-        <DataPanel v-show="inspectorTab === 'data'" :key="template?.templateUuid || 'empty'" @configure-rule="configureRecognitionRule" @correct="correctRecognition" :selected="supplementarySelected ? undefined : selected" :selection-count="selectedFields.length" :supplementary-selected="supplementarySelected" :has-supplementary="!!page?.supplementaryRegion" :has-template="!!page" :sample-name="sampleName" :sample-error="sampleError" :selecting-source="selectingSource" :recognizing="recognizing" :recognized="!!sampleResult" :can-recognize="!!sampleFile" :mapping="currentMapping" :mapping-fields="mappingFields" :picking="picking" :trial="trial" :trial-matching="trialMatching" @recognize="recognizeUploadedSample" @pick="beginSourceSelection" @cancel-pick="picking=false" @confirm="confirmMapping" @trial="toggleTrialPreview" @select-field="selectField($event)" @upload="sampleInput?.click()" @remove="removeSample" @configure="configureField" />
+        <DataPanel v-show="inspectorTab === 'data'" :key="template?.templateUuid || 'empty'" @configure-rule="configureRecognitionRule" @correct="correctRecognition" :selected="supplementarySelected ? undefined : selected" :selection-count="selectedFields.length" :supplementary-selected="supplementarySelected" :has-supplementary="!!page?.supplementaryRegion" :has-template="!!page" :sample-name="sampleName" :sample-error="sampleError" :selecting-source="selectingSource" :recognizing="recognizing" :recognized="!!sampleResult" :can-recognize="!!sampleFile" :mapping="currentMapping" :mapping-fields="mappingFields" :picking="picking" :trial="trial" :trial-matching="trialMatching" :sheet-name="sheetName" :sheet-error="sheetError" :sheet-matching="sheetMatching" :sheet-result="sheetResult" @recognize="recognizeUploadedSample" @pick="beginSourceSelection" @cancel-pick="picking=false" @confirm="confirmMapping" @trial="toggleTrialPreview" @select-field="selectField($event)" @upload="sampleInput?.click()" @remove="removeSample" @configure="configureField" @upload-sheet="sheetInput?.click()" @match-sheet="sheetFile && runMatchSheet(sheetFile)" />
         <div v-show="inspectorTab === 'properties'">
         <template v-if="selectedFields.length > 1">
           <section class="property-section">

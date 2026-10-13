@@ -1739,13 +1739,18 @@ def _table_rows_set(cells, header_row):
                    for c in row_cells if c['col'] < label_col):
                 break
             # 表单尾区标签行 (检查结论/审核人): 行首短文本无符号前缀,
-            # 且右侧整行无内容 -> 不是表体行, 表体到此为止
+            # 右侧整行无内容, 且右侧只有 1 个格 (尾区是整段合并格;
+            # 数据行规定值/实测值/合格率是多个空格, 不得误判) -> 表体到此
             def _tail_label(c):
                 t = (c.get('text') or '').replace('\n', '').strip()
-                return bool(t) and len(t) <= 12 \
-                    and t[0] not in _NO_LABEL_PREFIX \
-                    and not any((x.get('text') or '').strip()
-                                for x in row_cells if x['col'] > c['col'])
+                if not (t and len(t) <= 12
+                        and t[0] not in _NO_LABEL_PREFIX):
+                    return False
+                if any((x.get('text') or '').strip()
+                       for x in row_cells if x['col'] > c['col']):
+                    return False
+                right_cells = sum(1 for x in row_cells if x['col'] > c['col'])
+                return right_cells < 2
             if any(_tail_label(c) for c in row_cells
                    if c['col'] < max(label_col, 1)):
                 break
@@ -1919,6 +1924,33 @@ def augment_xlsx_semantics(page_data, wb_f, wb_v, max_candidates=50):
 
 
 _NO_LABEL_PREFIX = tuple('0123456789△▲□■＋±+-≤≥<>＝=%')
+# 值格占位文本: 年月日样式 (允许数字/点/横线), 如 "年  月  日"
+_PLACEHOLDER_RE = None  # 延迟编译, 见 _is_placeholder
+
+
+def _is_placeholder(text):
+    """text 是否是年月日类占位文本 (视为可覆盖写的空值格)。"""
+    import re
+    global _PLACEHOLDER_RE
+    if _PLACEHOLDER_RE is None:
+        _PLACEHOLDER_RE = re.compile(r'^(?=.*[年月日])[\s0-9年月日./-]{2,15}$')
+    return bool(_PLACEHOLDER_RE.match((text or '').strip()))
+
+
+def _ensure_pseudo_addr(data):
+    """没有原生地址 (语义对齐失败/图片 OCR 通路) 时补几何伪地址。
+
+    extract_fields/build_index 的配对链路都依赖 addr, 缺 addr 的格子会被
+    整条链路丢弃 (对齐失败一页 -> 模板索引全空)。伪地址按 文档尺寸+网格
+    坐标生成: 同表重转稳定 (uuid5 一致), 跨表几何不同不撞车。语义对齐
+    成功给的 'Sheet!A1' 真地址不受影响。"""
+    salt = f"{data.get('width', 0)}x{data.get('height', 0)}"
+    for c in data.get('cells') or []:
+        if not c.get('addr'):
+            c['addr'] = f"#G{salt}:{c['row']},{c['col']}"
+    for i, t in enumerate(data.get('texts') or []):
+        if not t.get('addr'):
+            t['addr'] = f"#T{salt}:{i}"
 
 
 def assign_roles(data):
@@ -1927,6 +1959,7 @@ def assign_roles(data):
     纯启发式 (按序判定, 先命中先生效), 供回填定位; 结果打印统计,
     配合 overlay.png 人工核对。表头行之下的空边框格一律可填 (含备用空行)。
     """
+    _ensure_pseudo_addr(data)
     cells = data['cells']
     if not cells:
         return
@@ -1969,7 +2002,15 @@ def assign_roles(data):
             if (nxt := by_grid.get((r + 1, hc))) is not None
             and text_of(nxt))
         if filled_below < 2:
-            continue
+            # 空白模板兜底: 表头下一行该列是带框空格 (整排待填, 如
+            # 规定值/实测值/合格率全空的数据行) 同样算表头
+            empty_grid = sum(
+                1 for hc in hcols
+                if (nxt := by_grid.get((r + 1, hc))) is not None
+                and not text_of(nxt)
+                and any((nxt.get('borders') or {}).values()))
+            if empty_grid < 2:
+                continue
         for c in row_cells:
             if text_of(c):
                 c['role'] = 'header'
@@ -1999,7 +2040,8 @@ def assign_roles(data):
         right = by_grid.get((c['row'], c['col'] + c['colspan']))
         below = by_grid.get((c['row'] + c['rowspan'], c['col']))
         right_empty = right is not None and (
-            not text_of(right) or '___' in (right.get('text') or ''))
+            not text_of(right) or '___' in (right.get('text') or '')
+            or _is_placeholder(right.get('text')))
         below_empty = below is not None and not text_of(below)
         if right_empty or below_empty:
             c['role'] = 'label'
@@ -2072,9 +2114,20 @@ def extract_fields(data):
         if not name:
             continue
         target = by_grid.get((c['row'], c['col'] + c['colspan']))
+        replace = False
         if target is not None and text_of(target) \
                 and '___' not in (target.get('text') or ''):
-            target = None
+            if _is_placeholder(target.get('text')):
+                replace = True  # "年 月 日" 占位 -> 覆盖写
+            else:
+                # 行尾合并值格自带短样例文本 (如 工程部位="土方路基") ->
+                # 按覆盖写配对; 右侧还有格子的短文本更像下一个标签
+                nxt = by_grid.get((target['row'],
+                                   target['col'] + target['colspan']))
+                if nxt is None and len(text_of(target)) <= 15:
+                    replace = True
+                else:
+                    target = None
         if target is None:
             below = by_grid.get((c['row'] + c['rowspan'], c['col']))
             if below is not None and not text_of(below):
@@ -2084,6 +2137,8 @@ def extract_fields(data):
         target['fillable'] = True
         target.setdefault('role', 'value')
         entry = {'name': name, 'label': c['addr'], 'value': target['addr']}
+        if replace:
+            entry['replace'] = True  # 回填时整格覆盖占位文本
         if '___' in (target.get('text') or ''):
             entry['underscore'] = True  # 回填时把下划线段替换为值
         fields.append(entry)
@@ -2102,16 +2157,18 @@ def extract_fields(data):
                 or not c.get('addr') or c['addr'] in claimed:
             continue
         t = text_of(c)
-        if not t or len(t) > 12 or t[0] in _NO_LABEL_PREFIX:
+        if not t or len(t) > 15 or t[0] in _NO_LABEL_PREFIX:
             continue
-        if not c.get('value_room'):
+        # value_room 缺省时, 行尾合并格 (右侧无格) 同样视为值格
+        row_end = by_grid.get((c['row'], c['col'] + c['colspan'])) is None
+        if not c.get('value_room') and not row_end:
             continue
         c['fillable'] = True
         # 左邻是标签样文本 -> 本格是它的值格, 已有文字视为占位, 整格替换
         # (占位文字要求短, 避免把 "基本要求" 配到后面的长 checklist 格)
         left = by_grid.get((c['row'], c['col'] - 1))
         lt = text_of(left) if left is not None else ''
-        if lt and len(t) <= 8 and len(lt) <= 12 \
+        if lt and len(t) <= 15 and len(lt) <= 12 \
                 and lt[0] not in _NO_LABEL_PREFIX \
                 and left.get('role') in (None, 'data') \
                 and left.get('addr') and left['addr'] not in claimed:
@@ -2195,7 +2252,9 @@ def extract_fields(data):
                     same = by_grid.get((c['row'], hc))
                     if same is None or text_of(same):
                         continue  # 该列此行已有内容 (如规定值), 不是填写列
-                    for rr in (c['row'] + 1, c['row']):
+                    # 本行空格优先; 下一行 (专用填写行) 仅在本行无地址时
+                    # 回退, 否则会错位到备用空行
+                    for rr in (c['row'], c['row'] + 1):
                         tc = by_grid.get((rr, hc))
                         if tc is None or text_of(tc) or not tc.get('addr'):
                             continue
@@ -2569,7 +2628,10 @@ def build_index(data):
                     if target is None or not (target.get('text') or '') \
                             .strip():
                         target = None
-                        for rr in (r + 1, r):
+                        # 本行该列的空格优先 (label 同排的值格); 下一行
+                        # (专用填写行) 仅在同行没有地址时回退, 否则会错位
+                        # 到备用空行 (如 宽度 的合格率写进下一空行)
+                        for rr in (r, r + 1):
                             tc = by_grid.get((rr, hc))
                             if tc is None \
                                     or (tc.get('text') or '').strip() \
@@ -2592,6 +2654,28 @@ def build_index(data):
                     col = {'cell': ref(target)}
                     if (target.get('text') or '').strip():
                         col['text'] = target['text']
+                    if '实测' in norm(hname):
+                        # 实测值类列: 登记列区内全部子格 (按 行,x 序),
+                        # 数据简表 measured 列表按序拆格填入 (模板拆格子)
+                        hcell = by_grid.get((header_row, hc))
+                        rs = kc.get('rowspan', 1) if kc else 1
+                        if hcell is not None and rs:
+                            hx0 = hcell['x']
+                            hx1 = hcell['x'] + hcell['w']
+                            subs = [c for c in cells
+                                    if c is not kc and c.get('addr')
+                                    and hx0 - 1 <= c['x'] + c['w'] / 2
+                                    < hx1 + 1
+                                    and r <= c['row'] < r + rs]
+                            subs.sort(key=lambda c: (c['row'], c['x']))
+                            col['cells'] = [ref(c) for c in subs]
+                            report.append({
+                                'level': 'info', 'type': 'value_cells',
+                                'row': kt, 'col': hname,
+                                'count': len(col['cells']),
+                                'message': f'行 "{kt}" 列 "{hname}" 有 '
+                                           f'{len(col["cells"])} 个值格, '
+                                           f'measured 按序拆格填入'})
                     row_doc.setdefault('columns', {})[hname] = col
                 if row_doc.get('columns'):
                     rows.append(row_doc)
@@ -2668,6 +2752,331 @@ def build_index(data):
     }
     print(f"index: header_fields {len(header_fields)} 个, rows {len(rows)}"
           f" 行, by_label {len(by_label)} 项, 报告 {len(report)} 条")
+
+
+# ---------------------------------------------------------------------------
+# 数据简表: 一次性匹配 JSON (用完即弃, 不落盘)
+#
+# 数据侧只回答两个问题: 这张表是什么 (title 路由模板), 有哪些字段和值
+# (name 匹配模板索引; specified/measured[]/pass_rate 是要填的值)。
+# 坐标/边框/字体一概不需要 —— 值该进哪几个格子由模板自己决定
+# (index rows[].columns[列名].cells: 实测值列区子格按 x 序的 uuid 清单,
+# measured 按序拆格; 规定值/合格率列保持单格)。
+# 已填表照片/扫描件走同一出口: 识别+按行标签取值后产出同样的
+# {title, fields}, 之后共用 match_data_fields。
+# ---------------------------------------------------------------------------
+
+def parse_data_sheet(path):
+    """数据简表 (简单表/复杂表) -> {title, context:{字段:值}, fields:[...]}。
+    解析结果用完即弃, 不落盘。"""
+    import openpyxl
+    wb = openpyxl.load_workbook(path, data_only=True)
+    best = None
+    for name in wb.sheetnames:
+        ws = wb[name]
+        merged = {}    # (row, col) -> 合并锚点值 (表头跨列合并时展开列角色)
+        expanded = {}  # (row, col) -> 锚点(row, col), 仅原本为空的展开格
+        for rng in ws.merged_cells.ranges:
+            v = ws.cell(row=rng.min_row, column=rng.min_col).value
+            for r in range(rng.min_row, rng.max_row + 1):
+                for c in range(rng.min_col, rng.max_col + 1):
+                    merged[(r, c)] = v
+                    if (r, c) != (rng.min_row, rng.min_col):
+                        expanded[(r, c)] = (rng.min_row, rng.min_col)
+        entries = []  # (原行号, 值列表, number_format 列表)
+        for row in ws.iter_rows():
+            vals, frow = [], []
+            for c in row:
+                v = c.value
+                if v is None and (c.row, c.column) in merged:
+                    v = merged[(c.row, c.column)]
+                vals.append(v)
+                frow.append(c.number_format or '')
+            if any(v is not None and str(v).strip() for v in vals):
+                entries.append((row[0].row, vals, frow))
+        fidx = {rn for rn, _, _ in entries}
+        exp_f = {}  # 仅保留非空行的展开格, 键沿用原行号
+        for (r, c), (ar, ac) in expanded.items():
+            if r in fidx and ar in fidx:
+                exp_f[(r, c)] = (ar, ac)
+        sheet = _parse_sheet_rows(entries, exp_f)
+        if sheet and (best is None
+                      or len(sheet['fields']) > len(best['fields'])):
+            best = sheet
+    if not best:
+        return {'title': None, 'context': {}, 'fields': []}
+    # 时间类上下文字段的 Excel 日期序列号 -> "2026年11月11日"
+    ctx = best.get('context')
+    if ctx:
+        import openpyxl.utils.datetime as xl_dt
+        fixed = {}
+        for k, v in ctx.items():
+            if ('时间' in k or '日期' in k) \
+                    and isinstance(v, (int, float)) and not isinstance(v, bool) \
+                    and 20000 <= v <= 80000:
+                d = xl_dt.from_excel(v)
+                fixed[k] = f'{d.year}年{d.month}月{d.day}日'
+            elif isinstance(v, str):
+                fixed[k] = v.strip()
+            else:
+                fixed[k] = v
+        best['context'] = fixed
+    return best
+
+
+def _parse_sheet_rows(entries, expanded=None):
+    """一张简表的行值 -> {title, context, fields}; 识别不出表头返回 None。
+
+    entries  [(原行号, 值列表, number_format 列表)], expanded
+    {(行号, 列): 锚点(行号, 列)} 记录合并展开的空格 (实测列去重用)。"""
+    import re
+
+    def hnorm(s):
+        return re.sub(r'\s+', '', str(s or ''))
+
+    def num(v, fmt=''):
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return str(v)
+        if isinstance(v, (int, float)):
+            x = float(v)
+            if '%' in fmt and abs(x) <= 1.0001:
+                x *= 100
+            return int(x) if x.is_integer() else round(x, 4)
+        s = str(v).strip().replace('%', '')
+        try:
+            return float(s) if ('.' in s) else int(s)
+        except ValueError:
+            return str(v).strip()
+
+    def values_of(v, fmt=''):
+        """单元格 -> 值列表: "1，2，3" / "2 ,3 ,4" 这类文本拆成多个数值,
+        拆不出数值则原样返回单个值。"""
+        if v is None:
+            return []
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return [num(v, fmt)]
+        s = str(v).strip()
+        if not s:
+            return []
+        parts = [p.strip() for p in re.split(r'[，,、;；\s]+', s) if p.strip()]
+        nums = []
+        ok = bool(parts)
+        for p in parts:
+            try:
+                nums.append(float(p) if ('.' in p) else int(p))
+            except ValueError:
+                ok = False
+                break
+        if ok and nums:
+            return nums
+        n = num(v, fmt)
+        return [n] if n is not None else []
+
+    title = None
+    header_idx = None
+    roles = None
+    title_kw = ('记录表', '检验表', '检测报告', '评定表', '验收表', '检查表')
+    label_kw = ('检测项目', '检查项目', '项目名称', '项目', '名称', '指标')
+    ctx_kw = ('单位', '合同段', '人', '时间', '部位', '编号', '桩号',
+              '日期', '名称', '签字', '意见')
+    for i, (rn, vals, fmtr) in enumerate(entries):
+        norms = [hnorm(v) for v in vals]
+        if header_idx is None:
+            for v in norms:
+                if len(v) >= 6 and any(k in v for k in title_kw):
+                    if title is None or len(v) > len(title):
+                        title = v
+            li = next((j for j, v in enumerate(norms)
+                       if v and any(k in v for k in label_kw)), None)
+            si = [j for j, v in enumerate(norms)
+                  if '规定值' in v or '标准值' in v or '允许偏差' in v]
+            mi = [j for j, v in enumerate(norms) if '实测' in v]
+            pi = [j for j, v in enumerate(norms)
+                  if '合格率' in v or '通过率' in v]
+            if li is not None and (si or mi):
+                header_idx = i
+                roles = {'label': li, 'specified': si[0] if si else None,
+                         'measured': mi, 'pass': pi[0] if pi else None}
+
+    if header_idx is None:
+        return None
+
+    # 上下文区: label格 (短文本, 命中关键词, 无数字) -> 同排右侧最近非空格
+    context = {}
+    for rn, vals, fmtr in entries[:header_idx]:
+        norms = [hnorm(v) for v in vals]
+        j = 0
+        while j < len(vals):
+            n = norms[j]
+            if not n:
+                j += 1
+                continue
+            if ('：' in n or ':' in n):  # 单格 "编号：JB12-4.5.2-4"
+                head = re.split(r'[：:]', n)[0]
+                if 1 <= len(head) <= 10 and any(k in head for k in ctx_kw):
+                    context[head] = re.split(r'[：:]', n, 1)[1] or None
+                    j += 1
+                    continue
+            if 1 <= len(n) <= 15 and any(k in n for k in ctx_kw) \
+                    and not re.search(r'\d', n):
+                k = j + 1
+                while k < len(vals) and not norms[k]:
+                    k += 1
+                if k < len(vals):
+                    context[n] = vals[k]
+                    j = k + 1
+                    continue
+            j += 1
+
+    fields = []
+    for rn, vals, fmtr in entries[header_idx + 1:]:
+        if roles['label'] >= len(vals):
+            continue
+        name = vals[roles['label']]
+        if name is None or not str(name).strip():
+            continue
+        f = {'name': str(name).strip()}
+        if roles['specified'] is not None and roles['specified'] < len(vals) \
+                and vals[roles['specified']] is not None:
+            f['specified'] = num(vals[roles['specified']],
+                                 fmtr[roles['specified']])
+        measured = []
+        for j in roles['measured']:
+            if j >= len(vals):
+                continue
+            # 合并展开的重复列 (表头跨列合并把同一实测格映到多列;
+            # expanded 键是 1-based 列号, j 是 0-based 下标)
+            anc = expanded.get((rn, j + 1)) if expanded else None
+            if anc and (anc[1] - 1) in roles['measured'] and anc[1] - 1 != j:
+                continue
+            measured.extend(values_of(vals[j], fmtr[j] if j < len(fmtr) else ''))
+        if measured:
+            f['measured'] = measured
+        if roles['pass'] is not None and roles['pass'] < len(vals) \
+                and vals[roles['pass']] is not None:
+            f['pass_rate'] = num(vals[roles['pass']],
+                                 fmtr[roles['pass']]
+                                 if roles['pass'] < len(fmtr) else '')
+        fields.append(f)
+    return {'title': title, 'context': context, 'fields': fields}
+
+
+def match_data_fields(sheet, index):
+    """数据简表 JSON -> {values: {fieldUuid: 值}, unmatched: [字段名, ...]}。
+
+    上下文区字段 (施工单位等) 走 header_fields/by_label; 数据区字段按
+    行标签匹配 rows, specified/measured[i]/pass_rate 分别进规定值列/
+    实测值列子格第 i 个/合格率列 (模板拆格子, 数据侧只按序给值)。
+    """
+    import re
+
+    def norm(s):
+        s = str(s or '').translate({ord('（'): '(', ord('）'): ')'})
+        return re.sub(r'[\s△▲Δ]+', '', s)
+
+    def text(v):
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+        return str(v)
+
+    def header_cell(k):
+        """header_fields 按归一化键查找 (值可能是 {cell: uuid} 或 uuid)。"""
+        hf = header_fields.get(k)
+        if hf is None:  # 模板侧键未归一, 扫一遍
+            hf = next((v for kk, v in header_fields.items()
+                       if norm(kk) == k), None)
+        if hf is None:
+            return None
+        return hf.get('cell') if isinstance(hf, dict) else hf
+
+    idx_cells = index.get('cells') or {}
+
+    def already_there(u, v):
+        """模板该格已有这个值 (印刷体/编号/规定值等) -> 无需映射覆盖。"""
+        t = norm((idx_cells.get(u) or {}).get('text') or '')
+        return bool(t) and norm(v) in t
+
+    values = {}
+    unmatched = []
+    rows = index.get('rows') or []
+    by_label = index.get('by_label') or {}
+    header_fields = index.get('header_fields') or {}
+
+    # 上下文区 (简表表头行以上): 走 header_fields/by_label 值格
+    for ck, cv in (sheet.get('context') or {}).items():
+        k = norm(ck)
+        if not k or cv is None:
+            continue
+        u = header_cell(k) or next(
+            (e.get('value') for e in by_label.get(k, []) if e.get('value')),
+            None)
+        if u is None:
+            unmatched.append(ck)
+            continue
+        v = text(cv)
+        if not already_there(u, v):
+            values[u] = v
+
+    for f in sheet.get('fields') or []:
+        name = f.get('name') or ''
+        k = norm(name)
+        if not k:
+            continue
+        measured = f.get('measured') or []
+        row = next((r for r in rows if norm(r.get('key')) == k), None)
+        if row is not None:
+            cols = row.get('columns') or {}
+            if f.get('specified') is not None:
+                sv = text(f['specified'])
+                for hn, col in cols.items():
+                    if '规定值' in norm(hn):
+                        if not already_there(col['cell'], sv):
+                            values[col['cell']] = sv
+                        break
+            slots = []
+            for hn, col in cols.items():
+                if '实测' in norm(hn):
+                    slots = col.get('cells') or [col['cell']]
+                    break
+            if len(slots) == 1 and len(measured) > 1:
+                # 模板该行实测区是一整个大格 (无子格) -> 值空格拼接写入
+                joined = ' '.join(text(v) for v in measured)
+                if not already_there(slots[0], joined):
+                    values[slots[0]] = joined
+            else:
+                for i, v in enumerate(measured):
+                    if i < len(slots):
+                        tv = text(v)
+                        if not already_there(slots[i], tv):
+                            values[slots[i]] = tv
+                    else:
+                        unmatched.append(f'{name} 第{i + 1}个值'
+                                         f'(模板该行只有 {len(slots)} 个值格)')
+            if f.get('pass_rate') is not None:
+                pv = text(f['pass_rate'])
+                for hn, col in cols.items():
+                    if '合格率' in norm(hn):
+                        if not already_there(col['cell'], pv):
+                            values[col['cell']] = pv
+                        break
+            continue
+        # 上下文字段/表尾字段: 值取 measured 首值, 否则 specified
+        u = header_cell(k) or next(
+            (e.get('value') for e in by_label.get(k, []) if e.get('value')),
+            None)
+        if u is None:
+            unmatched.append(name)
+            continue
+        v = measured[0] if measured else f.get('specified')
+        if v is None:
+            unmatched.append(f'{name} (简表无值)')
+            continue
+        tv = text(v)
+        if not already_there(u, tv):
+            values[u] = tv
+    return {'values': values, 'unmatched': unmatched}
 
 
 # ---------------------------------------------------------------------------
@@ -2825,6 +3234,10 @@ def stitch_page_data(pages):
                if base['cells'] else 0)  # 行号全局唯一化, 供网格邻接判定
     for pg in pages[1:]:
         if not pg['cells']:
+            break
+        # 延续页自带大标题 -> 是另一张表 (多工作簿/多表单), 不是宽表续页
+        if any(t.get('role') == 'title' for t in pg.get('texts') or []):
+            print('分页含独立表名, 视为另一张表, 不横向拼接')
             break
         ys = [c['y'] for c in pg['cells']]
         hit = sum(1 for y in ys if any(abs(y - y0) <= 6 for y0 in ys0))

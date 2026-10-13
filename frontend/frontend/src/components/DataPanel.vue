@@ -4,8 +4,8 @@ import { RiImageCircleLine, RiCursorHand } from '@remixicon/vue'
 import StyleSelect from './StyleSelect.vue'
 import { displayFieldValue } from '../utils/fieldValue'
 import type { Field, FieldDefinition, SourceMapping, BusinessField, MappingRule } from '../types/template'
-const props = defineProps<{ selected?: Field; supplementarySelected?:boolean; hasSupplementary?:boolean; selectionCount: number; hasTemplate: boolean; sampleName: string; sampleError: string; selectingSource: boolean; recognizing: boolean; recognized: boolean; canRecognize: boolean; mapping?: SourceMapping; mappingFields: Field[]; picking: boolean; trial: boolean; trialMatching: boolean }>()
-const emit = defineEmits<{ upload: []; remove: []; configure: [patch: Partial<FieldDefinition>]; configureRule:[rule:MappingRule]; correct:[text:string]; recognize: []; pick: []; cancelPick: []; confirm: []; trial: []; selectField: [field:Field] }>()
+const props = defineProps<{ selected?: Field; supplementarySelected?:boolean; hasSupplementary?:boolean; selectionCount: number; hasTemplate: boolean; sampleName: string; sampleError: string; selectingSource: boolean; recognizing: boolean; recognized: boolean; canRecognize: boolean; mapping?: SourceMapping; mappingFields: Field[]; picking: boolean; trial: boolean; trialMatching: boolean; sheetName: string; sheetError: string; sheetMatching: boolean; sheetResult?: { title: string | null; fields: Record<string, unknown>[]; values: Record<string, string>; unmatched: string[] } }>()
+const emit = defineEmits<{ upload: []; remove: []; configure: [patch: Partial<FieldDefinition>]; configureRule:[rule:MappingRule]; correct:[text:string]; recognize: []; pick: []; cancelPick: []; confirm: []; trial: []; selectField: [field:Field]; 'upload-sheet': []; 'match-sheet': [] }>()
 const draft = computed<FieldDefinition | undefined>(() => props.selected && props.selectionCount === 1 ? props.selected.definition || {name:'',dataType:'text',imageRecognition:true} : undefined)
 const showRule=ref(false),editing=ref(false),correction=ref('')
 watch(()=>props.selected?.fieldUuid,()=>{showRule.value=false;editing.value=false})
@@ -61,12 +61,14 @@ function state(mapping?:SourceMapping){return !mapping ? '未识别' : mapping.s
     <p v-if="trial" class="property-hint">正在试填预览，退出后恢复模板内容</p>
   </section>
   <section class="property-section">
-    <div class="property-heading">样例图片</div>
-    <template v-if="sampleName"><div class="data-sample-file"><RiImageCircleLine size="20px" aria-hidden="true" /><span :title="sampleName">{{ sampleName }}</span></div><div class="data-sample-actions"><button class="secondary" @click="emit('upload')">更换图片</button><button class="text-button" @click="emit('remove')">移除</button></div></template>
-    <button v-else class="data-upload" :disabled="!hasTemplate" @click="emit('upload')"><RiImageCircleLine size="28px" aria-hidden="true" /><strong>上传样例图片</strong><span>PNG、JPG、WebP 等图片格式</span></button>
-    <button v-if="sampleName" class="primary recognize-action" :disabled="trialMatching || recognizing || selectingSource || !canRecognize || (!mappingFields.length && !hasSupplementary)" @click="emit('recognize')">{{ recognizing ? '正在识别图片…' : recognized ? '重新识别图片' : '识别图片' }}</button>
-    <p v-if="sampleName && !recognized" class="property-hint">识别时，样例图片会发送至 PaddleOCR 云端</p>
-    <p v-if="sampleError" class="data-error" role="alert">{{ sampleError.replace(/。/g, '') }}</p>
+    <div class="property-heading">数据简表</div>
+    <template v-if="sheetName"><div class="data-sample-file"><RiImageCircleLine size="20px" aria-hidden="true" /><span :title="sheetName">{{ sheetName }}</span></div><div class="data-sample-actions"><button class="secondary" @click="emit('upload-sheet')">更换简表</button></div></template>
+    <button v-else class="data-upload" @click="emit('upload-sheet')"><RiImageCircleLine size="28px" aria-hidden="true" /><strong>上传数据简表</strong><span>按表名 / 编号自动匹配模板 (.xlsx)</span></button>
+    <button v-if="sheetName" class="primary recognize-action" :disabled="sheetMatching" @click="emit('match-sheet')">{{ sheetMatching ? '正在匹配…' : '重新匹配填值' }}</button>
+    <details v-if="sheetResult" class="field-results"><summary>匹配结果 <small>{{ Object.keys(sheetResult.values).length }} 个值<span v-if="sheetResult.unmatched.length"> · {{ sheetResult.unmatched.length }} 项未匹配</span></small></summary>
+      <div class="mapping-list sheet-result"><p class="property-hint">标题:{{ sheetResult.title || '未识别' }} · 字段 {{ sheetResult.fields.length }} 个</p><p v-if="sheetResult.unmatched.length" class="data-error">未匹配: {{ sheetResult.unmatched.join('、') }}</p></div>
+    </details>
+    <p v-if="sheetError" class="data-error" role="alert">{{ sheetError.replace(/。/g, '') }}</p>
   </section>
 </div>
 </template>
