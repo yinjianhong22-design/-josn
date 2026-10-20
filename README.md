@@ -27,6 +27,20 @@
 - `data.json` / `data.js` / `index.html` —— 纯渲染层（file:// 直接打开 index.html 可看还原效果）
 - `rebuilt.pdf` / `1_office.pdf` —— 还原 PDF 与排版引擎原样 PDF
 
+## OCR 服务（可选）
+
+把 RapidOCR 包成本地 HTTP 服务，模型常驻内存，`extract_grid.py` 的逐格 OCR 不再进程内加载模型：
+
+```bash
+.venv/Scripts/python.exe ocr_service.py            # 默认 127.0.0.1:8100
+.venv/Scripts/python.exe extract_grid.py scan.png --ocr-url http://127.0.0.1:8100 -o grid_out
+```
+
+- 不传 `--ocr-url`（且环境变量 `OCR_SERVICE_URL` 为空）时保持进程内识别，行为不变
+- 设置了服务地址但服务不可达：直接报错，不静默回退
+- 接口：`POST /ocr/cells`，请求整图 PNG(base64) + 格子坐标列表批量提交，响应只含有文字的格子；裁剪/漏检兜底逻辑与本地路径一致
+- 引擎自动探测 GPU：装 `onnxruntime-gpu`（+ nvidia cu12 运行库 pip 包）时三模型全部上 CUDA，初始化失败自动回退 CPU 并打印提示
+
 ## 模板服务（前后端联调）
 
 ```bash

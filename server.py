@@ -81,7 +81,8 @@ def _convert_args():
     import argparse
     return argparse.Namespace(
         page=0, dpi=300, h_ratio=0.1, v_ratio=0.03, h_min_span=0.28,
-        v_min_span=0.04, no_ocr=False, force_ocr=False, no_office=False,
+        v_min_span=0.04, h_span_ratio=0.45, v_span_ratio=0.20,
+        no_ocr=False, force_ocr=False, no_office=False,
         out=None, input=None, h_ratio_set=None)
 
 
@@ -140,21 +141,38 @@ def _route_template(sheet):
 async def _parse_sheet_upload(file, upload_dir):
     """校验/暂存/解析数据简表上传, 返回 (sheet, 暂存路径)。
 
-    暂存文件保留 (前端左侧画板要拿它生成预览图)。"""
+    xlsx 走 openpyxl 直读; 已填表照片走 OCR 识别 (与模板制作同一套
+    算法), 出口是同构的 {title, context, fields}。暂存文件保留供前端
+    生成左侧预览图。"""
     from fastapi import HTTPException
     import extract_grid
     stem, ext = os.path.splitext(file.filename or '')
-    if ext.lower() not in ('.xlsx', '.xls'):
-        raise HTTPException(400, '仅支持 .xlsx/.xls 数据简表')
+    ext = ext.lower()
+    if ext not in ('.xlsx', '.xls') + _IMG_EXT:
+        raise HTTPException(400, '仅支持 .xlsx/.xls 数据简表或已填表照片')
     os.makedirs(upload_dir, exist_ok=True)
     tmp = os.path.join(upload_dir, f'sheet_{os.getpid()}{ext}')
     with open(tmp, 'wb') as f:
         f.write(await file.read())
-    sheet = extract_grid.parse_data_sheet(tmp)
+    if ext in ('.xlsx', '.xls'):
+        sheet = extract_grid.parse_data_sheet(tmp)
+        empty_hint = ''
+    else:
+        data = extract_grid.extract_page(tmp, 0, _convert_args())
+        if not data or not data.get('cells'):
+            raise HTTPException(400, '照片中未检测到表格, 请拍正拍清晰后重试')
+        extract_grid.assign_roles(data)
+        extract_grid.extract_fields(data)
+        extract_grid.build_index(data)
+        sheet = extract_grid.photo_to_sheet(data)
+        print(f"[match-sheet] 照片简表: title={sheet['title']} "
+              f"fields={len(sheet['fields'])}")
+        empty_hint = ('; 照片识别率有限, 若简表本身是 Excel, '
+                      '建议直接上传 .xlsx 文件而非截图/照片')
     if not sheet['fields']:
         raise HTTPException(400,
                             '未能从简表解析出字段 '
-                            '(需要 项目/规定值/实测值 类表头)')
+                            '(需要 项目/规定值/实测值 类表头)' + empty_hint)
     return sheet, tmp
 
 

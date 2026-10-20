@@ -63,7 +63,7 @@ function state(mapping?:SourceMapping){return !mapping ? '未识别' : mapping.s
   <section class="property-section">
     <div class="property-heading">数据简表</div>
     <template v-if="sheetName"><div class="data-sample-file"><RiImageCircleLine size="20px" aria-hidden="true" /><span :title="sheetName">{{ sheetName }}</span></div><div class="data-sample-actions"><button class="secondary" @click="emit('upload-sheet')">更换简表</button></div></template>
-    <button v-else class="data-upload" @click="emit('upload-sheet')"><RiImageCircleLine size="28px" aria-hidden="true" /><strong>上传数据简表</strong><span>按表名 / 编号自动匹配模板 (.xlsx)</span></button>
+    <button v-else class="data-upload" @click="emit('upload-sheet')"><RiImageCircleLine size="28px" aria-hidden="true" /><strong>上传数据简表</strong><span>按表名 / 编号自动匹配模板 (.xlsx / 已填表照片)</span></button>
     <button v-if="sheetName" class="primary recognize-action" :disabled="sheetMatching" @click="emit('match-sheet')">{{ sheetMatching ? '正在匹配…' : '重新匹配填值' }}</button>
     <details v-if="sheetResult" class="field-results"><summary>匹配结果 <small>{{ Object.keys(sheetResult.values).length }} 个值<span v-if="sheetResult.unmatched.length"> · {{ sheetResult.unmatched.length }} 项未匹配</span></small></summary>
       <div class="mapping-list sheet-result"><p class="property-hint">标题:{{ sheetResult.title || '未识别' }} · 字段 {{ sheetResult.fields.length }} 个</p><p v-if="sheetResult.unmatched.length" class="data-error">未匹配: {{ sheetResult.unmatched.join('、') }}</p></div>

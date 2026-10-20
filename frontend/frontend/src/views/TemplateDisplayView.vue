@@ -873,7 +873,7 @@ onMounted(() => refresh().catch(() => { error.value = '无法连接文档服务�
   <div class="workspace" :inert="printOpen" @dragover.prevent @drop.prevent="drop">
     <input ref="sampleInput" class="file-input" type="file" accept="image/*" aria-label="上传样例图片文件" @change="showSample" />
     <input ref="input" class="file-input" type="file" accept=".pdf,.xlsx,.xls,.docx,.doc,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp" @change="onFile" />
-    <input ref="sheetInput" class="file-input" type="file" accept=".xlsx,.xls" aria-label="上传数据简表文件" @change="onSheetFile" />
+    <input ref="sheetInput" class="file-input" type="file" accept=".xlsx,.xls,.png,.jpg,.jpeg,.bmp,.webp" aria-label="上传数据简表文件" @change="onSheetFile" />
     <header class="appbar">
       <img class="app-logo" src="/logo.png" alt="SDIG" />
       <div class="app-actions">
