@@ -15,6 +15,8 @@
 # 数据简表: 一次性匹配 JSON (用完即弃, 不落盘)
 # ---------------------------------------------------------------------------
 
+from .column_roles import normalize_column_role
+
 
 def photo_to_sheet(data):
     """已填表照片 -> 数据简表 JSON {title, context, fields}。
@@ -89,20 +91,20 @@ def photo_to_sheet(data):
             continue
         got = False
         for hn, col in (r.get('columns') or {}).items():
-            nhn = norm(hn)
-            if '规定值' in nhn or '允许偏差' in nhn or '标准值' in nhn:
+            role = normalize_column_role(hn)
+            if role == 'specified':
                 t = cell_text(col['cell'])
                 if t:
                     f['specified'] = t
                     got = True
-            elif '实测' in nhn:
+            elif role == 'measured':
                 vals = []
                 for u in (col.get('cells') or [col['cell']]):
                     vals.extend(_split_numbers(cell_text(u)))
                 if vals:
                     f['measured'] = vals
                     got = True
-            elif '合格率' in nhn or '通过率' in nhn:
+            elif role == 'pass_rate':
                 t = cell_text(col['cell']).replace('%', '').strip()
                 try:
                     f['pass_rate'] = float(t) if '.' in t else int(t)
@@ -255,11 +257,13 @@ def _parse_sheet_rows(entries, expanded=None):
                         title = v
             li = next((j for j, v in enumerate(norms)
                        if v and any(k in v for k in label_kw)), None)
-            si = [j for j, v in enumerate(norms)
-                  if '规定值' in v or '标准值' in v or '允许偏差' in v]
-            mi = [j for j, v in enumerate(norms) if '实测' in v]
-            pi = [j for j, v in enumerate(norms)
-                  if '合格率' in v or '通过率' in v]
+            column_roles = [normalize_column_role(v) for v in norms]
+            si = [j for j, role in enumerate(column_roles)
+                  if role == 'specified']
+            mi = [j for j, role in enumerate(column_roles)
+                  if role == 'measured']
+            pi = [j for j, role in enumerate(column_roles)
+                  if role == 'pass_rate']
             if li is not None and (si or mi):
                 header_idx = i
                 roles = {'label': li, 'specified': si[0] if si else None,

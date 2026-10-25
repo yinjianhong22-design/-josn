@@ -11,8 +11,7 @@ from .fields import _is_placeholder
 
 _xlsx_anchor = _import_module('..align.xlsx_anchor', __package__)
 _ensure_pseudo_addr = _xlsx_anchor._ensure_pseudo_addr
-_pick_header_row = _xlsx_anchor._pick_header_row
-_table_rows_set = _xlsx_anchor._table_rows_set
+from .table_topology import _pick_header_row, _table_rows_set
 
 
 def assign_roles(data):

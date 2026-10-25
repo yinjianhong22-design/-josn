@@ -5,7 +5,7 @@
 # ---------------------------------------------------------------------------
 
 from ..common import _import_pymupdf
-from .ocr_free import _classify_line_roles
+from .line_roles import _classify_line_roles
 
 
 def extract_pdf_text(path, page, dpi, cells):
@@ -36,7 +36,7 @@ def extract_pdf_text(path, page, dpi, cells):
                            for ch in s.get('chars', [])).strip()
             if not text:
                 continue
-            # 逐字符定位: WPS/Excel 转出的行常用前导空格做缩进/对齐,
+            # 逐字符定位: 排版引擎(WPS/Excel)转出的行常用前导空格做缩进/对齐,
             # span 的 origin/bbox 把空格宽度也算进去, 直接用会让文字
             # 整体左移、宽度虚增(触发错误的逐字均摊); 改用非空格字符
             # 的实际 bbox 和首个非空格字符的基线起点

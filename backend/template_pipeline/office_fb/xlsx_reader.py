@@ -19,8 +19,10 @@ def xlsx_to_data(path, dpi=96):
     wb_f = openpyxl.load_workbook(path)                  # 公式
     wb_v = openpyxl.load_workbook(path, data_only=True)  # 缓存值
     s = dpi / 72.0
-    bwidth = {'hair': 0.5, 'thin': 1.0, 'medium': 2.0, 'thick': 3.0,
-              'double': 3.0, 'dashed': 1.0, 'dotted': 0.5}
+    # openpyxl 边框宽度为 pt；标准 JSON 的 rules.width 统一存最终像素。
+    bwidth = {name: width * s for name, width in {
+        'hair': 0.5, 'thin': 1.0, 'medium': 2.0, 'thick': 3.0,
+        'double': 3.0, 'dashed': 1.0, 'dotted': 0.5}.items()}
 
     cells, texts, rules = [], [], []
     by_addr = {}

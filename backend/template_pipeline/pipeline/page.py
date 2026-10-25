@@ -74,7 +74,7 @@ def extract_page(input_path, page, args, diagnostics=True):
     # 页面一角时容易丢外框线(邻线缺失引发连锁过滤), 矢量线段正好补上
     is_pdf = detect_input_type(input_path) == 'pdf'
     rules = []
-    if is_pdf and not args.force_ocr:
+    if is_pdf:
         rules = extract_pdf_rules(input_path, page, args.dpi)
         if rules:
             horiz_c, vert_c, h_pos, v_pos = merge_line_sources(
@@ -140,6 +140,8 @@ def extract_page(input_path, page, args, diagnostics=True):
 
     data = build_table_data(cells, texts, horiz_c, vert_c, args.dpi,
                             (img.shape[1], img.shape[0]), free_texts, rules)
+    # 背景候选必须跟随实际提取页，不能由下游默认回第 0 页。
+    data['source_page'] = page
 
     if diagnostics:
         n_txt = sum(1 for b in blocks if b['type'] == 'text')

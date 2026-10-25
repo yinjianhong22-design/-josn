@@ -7,21 +7,55 @@
 from importlib import import_module as _import_module
 
 from ..common import (cv2, json, np, os, _import_pymupdf, _IMG_EXT)
-from .rebuild import _field_style
 
 # _INDEX_NS 是 semantic.index 的延迟初始化全局状态 (uuid5
 # namespace), 通过模块引用访问以保持与原全局变量同等的惰性
 _index_mod = _import_module('..semantic.index', __package__)
 
 
-def build_template(data, out_dir, source_paths=(), fallback_pdf=None,
-                   name=None, bg_url='background.png'):
+# ---------------------------------------------------------------------------
+# 字体映射/字段样式 (PDF 重画链路已删除, 仅服务字段覆盖层)
+# ---------------------------------------------------------------------------
+
+def _font_family(name):
+    """归一化字体名: 去 PDF 子集前缀 (ABCDEE+SimSun), 中文名映射英文，
+    对齐前端 fonts.ts 的 documentFonts 候选。"""
+    if not name:
+        return None
+    name = str(name).split('+')[-1].strip()
+    return _FONT_ALIASES.get(name, name)
+
+
+_FONT_ALIASES = {
+    '宋体': 'SimSun', '黑体': 'SimHei', '微软雅黑': 'Microsoft YaHei',
+    '仿宋': 'FangSong', '楷体': 'KaiTi', '等线': 'DengXian',
+    'ArialMT': 'Arial', 'TimesNewRomanPSMT': 'Times New Roman',
+}
+
+
+def _field_style(e, size):
+    """index.cells 实体 -> 前端 FieldStyle (字体/字号/颜色/对齐)。"""
+    style = {'fontSizePt': size,
+             'horizontalAlign': e.get('align') or 'center',
+             'verticalAlign': 'center'}
+    fam = _font_family(e.get('font'))
+    if fam:
+        style['fontFamily'] = fam
+    if e.get('color'):
+        style['color'] = e['color']
+    if e.get('bold'):
+        style['bold'] = True
+    return style
+
+
+def build_template(data, out_dir, source_paths=(), name=None,
+                   bg_url='background.png', source_ext=None, source_page=None):
     """生成前端 Template JSON (template.json) + 背景图 background.png。
 
     前端复现采用"背景图 + 字段覆盖层"混合方案 (frontend TemplatePage.vue):
-    - 背景图: pymupdf 把排版引擎的原样 PDF (office 转换件; 几何不匹配时
-      退到 rebuilt.pdf) 按 2px/pt 栅格化成 background.png,
-      "原样张"视觉上由它保证;
+    - 背景图: 有排版引擎 PDF/原始图片/PDF 候选时, pymupdf/解码归一化成
+      background.png, "原样张"视觉上由它保证; 无候选 (office_fb 简化排版
+      通路) 时由 data 自渲染 (office_fb.render, 白底 + 线 + 文字);
     - 字段层: OpenCV 探测网格的每一格变成一个 Field (与背景表格线严格
       对齐), rect 为占页宽/页高的比例坐标, uuid = uuid5(addr) 与
       index.cells 同一 uuid —— header_fields/rows/by_label 的 value
@@ -32,6 +66,10 @@ def build_template(data, out_dir, source_paths=(), fallback_pdf=None,
     前端字号公式 fontSizePt*2/page.width*100cqw (TemplatePage.vue) 和
     PrintPreview 的 page.width/2*25.4/72 (mm) 都按这个约定消费。
     无 index 的通路 (图片/PDF) 退化为逐格生成 Field。
+    背景候选 (source_paths) 的几何 (页面点大小) 必须与探测网格一致才
+    采用; 传了候选但全部不匹配时直接 raise RuntimeError (不静默产出
+    几何不可信的模板); source_paths 为空时自渲染背景 (source_ext
+    提供 sourceFormat, 如 '.xlsx'/'.docx')。
     """
     import uuid as _uuid
     fitz = _import_pymupdf()
@@ -44,7 +82,11 @@ def build_template(data, out_dir, source_paths=(), fallback_pdf=None,
     bg_path = os.path.join(out_dir, 'background.png')
     used_src = None
     bg_wh = None
-    for cand in list(source_paths) + ([fallback_pdf] if fallback_pdf else []):
+    if source_page is None:
+        source_page = data.get('source_page', 0)
+    synthetic_bg = data.get('_background_path')
+    candidates = ([synthetic_bg] if synthetic_bg else []) + list(source_paths)
+    for cand in candidates:
         if not cand or not os.path.exists(cand):
             continue
         if os.path.splitext(cand)[1].lower() in _IMG_EXT:
@@ -66,14 +108,18 @@ def build_template(data, out_dir, source_paths=(), fallback_pdf=None,
         doc = None
         try:
             doc = fitz.open(cand)
-            if len(doc) >= 1:
-                p = doc[0]
-                if abs(p.rect.width - pt_w) <= max(2.0, pt_w * 0.02) and \
-                        abs(p.rect.height - pt_h) <= max(2.0, pt_h * 0.02):
-                    pix = p.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                    pix.save(bg_path)
-                    used_src = cand
-                    bg_wh = (pix.width, pix.height)
+            if not 0 <= source_page < len(doc):
+                raise RuntimeError(
+                    f'背景 PDF 共 {len(doc)} 页, 无效的页码 {source_page}')
+            p = doc[source_page]
+            if abs(p.rect.width - pt_w) <= max(2.0, pt_w * 0.02) and \
+                    abs(p.rect.height - pt_h) <= max(2.0, pt_h * 0.02):
+                pix = p.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                pix.save(bg_path)
+                used_src = cand
+                bg_wh = (pix.width, pix.height)
+        except RuntimeError:
+            raise
         except Exception:
             pass
         finally:
@@ -81,6 +127,16 @@ def build_template(data, out_dir, source_paths=(), fallback_pdf=None,
                 doc.close()
         if used_src:
             break
+    if not used_src:
+        if candidates:
+            cands = [p for p in candidates if p]
+            raise RuntimeError(
+                '背景图生成失败: 所有背景候选的几何都与探测网格不匹配 '
+                f'(data 尺寸 {pt_w:.1f}x{pt_h:.1f} pt, 候选 {cands})')
+        # 无背景候选: office_fb 简化排版通路, 由 data 自渲染背景
+        from ..office_fb.render import save_background
+        bg_wh = save_background(data, bg_path)
+        print('背景: 自渲染 (office_fb 简化排版)')
 
     # 字段层: OpenCV 探测网格的每一格 -> Field, 与背景表格线严格对齐;
     # uuid = uuid5(addr), 与 index.cells 同一 uuid, 回填定位零换算;
@@ -89,7 +145,9 @@ def build_template(data, out_dir, source_paths=(), fallback_pdf=None,
     # 识别文字一律进 label (不进 textOverride, 覆盖层只在运行时填值出现)
     ns = _index_mod._INDEX_NS or _uuid.UUID('7d4f2a90-3b1c-5e6a-9f08-2d5b8c4a7e91')
     idx_cells = ((data.get('index') or {}).get('cells')) or {}
-    W, H = data['width'], data['height']
+    # 坐标分母与最终背景同源；自渲染扩画布后不能使用原 data.height。
+    # 背景统一为 2px/pt，换算回 data 所使用的 dpi 像素坐标。
+    W, H = bg_wh[0] * dpi / 144.0, bg_wh[1] * dpi / 144.0
     fields = []
     seen = set()
 
@@ -154,21 +212,20 @@ def build_template(data, out_dir, source_paths=(), fallback_pdf=None,
 
     form_meta = ((data.get('form') or {}).get('meta')) or {}
     tpl_name = (name or form_meta.get('title') or '未命名表单')
-    ext = os.path.splitext(os.path.basename(used_src or ''))[1]
+    ext = (os.path.splitext(os.path.basename(used_src))[1]
+           if used_src else (source_ext or ''))
     template = {
         'templateUuid': str(_uuid.uuid5(ns, 'template:' + tpl_name)),
         'name': tpl_name,
         'version': 1,
-        'sourceFormat': (ext.lstrip('.') if used_src
-                         else os.path.splitext(os.path.basename(
-                             fallback_pdf or ''))[1].lstrip('.') or 'data'),
+        'sourceFormat': ext.lstrip('.'),
         'pages': [{
             'pageUuid': str(_uuid.uuid5(ns, 'page:' + tpl_name)),
             'pageNo': 1,
-            # 背景像素尺寸 (无背景时按 2px/pt 折算, 保持同一约定)
-            'width': bg_wh[0] if bg_wh else round(pt_w * 2, 2),
-            'height': bg_wh[1] if bg_wh else round(pt_h * 2, 2),
-            'background': bg_url if used_src else '',
+            # 背景像素尺寸 (2px/pt 栅格的宽/高)
+            'width': bg_wh[0],
+            'height': bg_wh[1],
+            'background': bg_url,
             'fields': fields,
         }],
     }
@@ -176,5 +233,5 @@ def build_template(data, out_dir, source_paths=(), fallback_pdf=None,
     with open(tpl_path, 'w', encoding='utf-8') as f:
         json.dump(template, f, ensure_ascii=False, indent=2)
     print(f'前端模板: {tpl_path} (字段 {len(fields)} 个, 背景 '
-          f'{os.path.basename(used_src) if used_src else "无"})')
+          f'{os.path.basename(used_src) if used_src else "自渲染"})')
     return tpl_path

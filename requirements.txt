@@ -1,0 +1,33 @@
+# 项目后端依赖 (Python 3.10+)
+# 安装: pip install -r requirements.txt
+# 版本与开发环境 (.venv) 实测一致
+
+# ---- Web 服务 ----
+fastapi==0.143.0
+uvicorn==0.54.0
+pydantic==2.14.1
+python-multipart==0.0.32   # fastapi 文件上传 (UploadFile) 必需
+
+# ---- OCR 推理 (RapidOCR + ONNX Runtime) ----
+rapidocr-onnxruntime==1.2.3
+# GPU 版; 无 NVIDIA 显卡的环境改为: onnxruntime==1.24.1
+onnxruntime-gpu==1.24.1
+# onnxruntime-gpu >= 1.24 的 Windows wheel 不再捆绑 CUDA DLL,
+# 以下 nvidia pip 包提供 CUDA 12 / cuDNN 运行库 (CPU 环境可省略)
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cuda-runtime-cu12==12.9.79
+nvidia-cudnn-cu12==9.27.0.42
+nvidia-cufft-cu12==11.4.1.4
+
+# ---- 图像 / PDF ----
+opencv-python==5.0.0.93
+numpy==2.5.3
+pillow==12.3.0
+pymupdf==1.28.2
+
+# ---- Office 文档解析 ----
+openpyxl==3.1.5
+python-docx==1.2.0
+
+# ---- 仅 Windows: docx/xlsx 转 PDF 走 Office COM (office_convert.py) ----
+pywin32==312; platform_system == "Windows"

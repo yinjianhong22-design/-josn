@@ -27,10 +27,13 @@
 from importlib import import_module as _import_module
 
 _xlsx_anchor = _import_module('..align.xlsx_anchor', __package__)
-_group_free_text_lines = _xlsx_anchor._group_free_text_lines
-_pick_header_row = _xlsx_anchor._pick_header_row
-_label_col = _xlsx_anchor._label_col
-_table_rows_set = _xlsx_anchor._table_rows_set
+from .table_topology import (
+    _group_free_text_lines,
+    _label_col,
+    _pick_header_row,
+    _table_rows_set,
+    discover_table,
+)
 
 
 _INDEX_NS = None  # uuid5 namespace, 延迟生成
@@ -49,9 +52,9 @@ def build_index(data):
         return re.sub(r'\s+', '', str(s or ''))
 
     cells = data['cells']
-    by_grid = {(c['row'], c['col']): c for c in cells}
-    header_row = _pick_header_row(
-        cells, {c['row'] for c in cells if c.get('role') == 'header'})
+    topology = discover_table(cells)
+    by_grid = topology['by_grid']
+    header_row = topology['header_row']
 
     # 同 addr 的游离文字按视觉行拼接 (一个原生格常被拆成多个 seg,
     # 如 A3 = "监理单位：..." + "JB12-4.2.2-"), 拼接后占位提取才完整
@@ -111,11 +114,7 @@ def build_index(data):
         return u
 
     def mode_of(u, f):
-        """按 fields 的配对 mode 标注定填充方式; 占位文本进报告。
-
-        append 型以 prefix 为占位: 值插在标签之后, 原标签后的其余
-        内容 (如共享格里的下一字段) 保留。
-        """
+        """登记字段填充方式; 共享格逐字段保留 prefix/placeholder。"""
         if f.get('inline'):
             mode = 'inline'
         elif f.get('replace'):
@@ -124,23 +123,56 @@ def build_index(data):
             mode = 'append'
         else:
             mode = 'overwrite'
-        text = idx_cells[u].get('text')
-        if mode == 'append' and f.get('prefix'):
-            placeholder = f['prefix']
+        cell = idx_cells[u]
+        text = cell.get('text') or ''
+        prefix = f.get('prefix')
+        if mode == 'append' and prefix:
+            placeholder = prefix
         elif mode == 'inline' and text:
-            # 占位 = 最后一个冒号之后的值文本 (整行共享格/整格内联均适用)
-            tail = re.split(r'[:：]', text)[-1]
-            placeholder = tail.strip() or text
+            placeholder = None
+            if prefix and prefix in text:
+                start = text.index(prefix) + len(prefix)
+                ends = []
+                # 同一原生格可含多个字段, 当前字段的值段到下一字段前缀止。
+                for other in data.get('fields') or []:
+                    op = other.get('prefix')
+                    other_addr = other.get('value') or other.get('label')
+                    if other is f or not op or op == prefix \
+                            or other_addr != cell.get('addr'):
+                        continue
+                    pos = text.find(op, start)
+                    if pos >= 0:
+                        ends.append(pos)
+                end = min(ends) if ends else len(text)
+                placeholder = text[start:end].strip() or None
+            if placeholder is None and not prefix:
+                placeholder = re.split(r'[:：]', text)[-1].strip() or text
         elif text:
             placeholder = text
         else:
             placeholder = None
-        idx_cells[u]['mode'] = mode
+
+        # 顶层字段保持旧索引结构; bindings 让共享格的每个字段仍使用自己的
+        # 填充语义, 不会被最后登记的字段覆盖。
+        cell['mode'] = mode
+        if prefix:
+            cell['prefix'] = prefix
+        else:
+            cell.pop('prefix', None)
         if placeholder:
-            idx_cells[u]['placeholder'] = placeholder
+            cell['placeholder'] = placeholder
+        else:
+            cell.pop('placeholder', None)
+        binding = {'name': f['name'], 'mode': mode}
+        if prefix:
+            binding['prefix'] = prefix
+        if placeholder:
+            binding['placeholder'] = placeholder
+        cell.setdefault('bindings', []).append(binding)
+        if placeholder:
             report.append({
                 'level': 'info', 'type': 'placeholder_fill',
-                'field': f['name'], 'cell': u, 'addr': idx_cells[u]['addr'],
+                'field': f['name'], 'cell': u, 'addr': cell['addr'],
                 'placeholder': placeholder, 'mode': mode,
                 'message': f'"{f["name"]}" 值格含占位文本 '
                            f'"{placeholder}", 按 {mode} 填充'})
@@ -215,91 +247,57 @@ def build_index(data):
             _reg_label()
 
         # ---- 数据区: 表体行 -> 字段 -> 各列 (规定值/实测值/合格率) ----
-        headers = {}
-        for c in cells:
-            if c['row'] == header_row and (c.get('text') or '').strip():
-                headers.setdefault(c['col'],
-                                   (c.get('text') or '').replace('\n', '')
-                                   .strip())
-        table_rows = _table_rows_set(cells, header_row)
-        counts = {}
-        for c in cells:
-            if c['row'] in table_rows and (c.get('text') or '').strip():
-                counts[c['col']] = counts.get(c['col'], 0) + 1
-        if counts and headers:
-            label_col = _label_col(counts)
-            for r in sorted(table_rows):
-                kc = by_grid.get((r, label_col))
-                kt = (kc.get('text') or '').replace('\n', '').strip() \
-                    if kc else ''
-                if not kt:
-                    continue  # 专用填写行/备用空行
-                row_doc = {'key': kt, 'key_cell': ref(kc)}
-                add_label(kc, None)
-                for hc, hname in headers.items():
-                    if hc == label_col:
-                        continue
-                    target = by_grid.get((r, hc))
-                    if target is None or not (target.get('text') or '') \
-                            .strip():
-                        target = None
-                        # 本行该列的空格优先 (label 同排的值格); 下一行
-                        # (专用填写行) 仅在同行没有地址时回退, 否则会错位
-                        # 到备用空行 (如 宽度 的合格率写进下一空行)
-                        for rr in (r, r + 1):
-                            tc = by_grid.get((rr, hc))
-                            if tc is None \
-                                    or (tc.get('text') or '').strip() \
-                                    or not tc.get('addr'):
-                                continue
-                            if rr == r + 1:
-                                lbl = by_grid.get((rr, label_col))
-                                if lbl is not None \
-                                        and (lbl.get('text') or '').strip():
-                                    continue
-                            target = tc
-                            break
-                    if target is None or not target.get('addr'):
-                        report.append({'level': 'warn',
-                                       'type': 'missing_col',
-                                       'row': kt, 'col': hname,
-                                       'message': f'行 "{kt}" 缺列 '
-                                                  f'"{hname}" 的值格'})
-                        continue
-                    col = {'cell': ref(target)}
-                    if (target.get('text') or '').strip():
-                        col['text'] = target['text']
-                    if '实测' in norm(hname):
-                        # 实测值类列: 登记列区内全部子格 (按 行,x 序),
-                        # 数据简表 measured 列表按序拆格填入 (模板拆格子)
-                        hcell = by_grid.get((header_row, hc))
-                        rs = kc.get('rowspan', 1) if kc else 1
-                        if hcell is not None and rs:
-                            hx0 = hcell['x']
-                            hx1 = hcell['x'] + hcell['w']
-                            subs = [c for c in cells
-                                    if c is not kc and c.get('addr')
-                                    and hx0 - 1 <= c['x'] + c['w'] / 2
-                                    < hx1 + 1
-                                    and r <= c['row'] < r + rs]
-                            subs.sort(key=lambda c: (c['row'], c['x']))
-                            col['cells'] = [ref(c) for c in subs]
-                            report.append({
-                                'level': 'info', 'type': 'value_cells',
-                                'row': kt, 'col': hname,
-                                'count': len(col['cells']),
-                                'message': f'行 "{kt}" 列 "{hname}" 有 '
-                                           f'{len(col["cells"])} 个值格, '
-                                           f'measured 按序拆格填入'})
-                    row_doc.setdefault('columns', {})[hname] = col
-                if row_doc.get('columns'):
-                    rows.append(row_doc)
-                else:
-                    report.append({'level': 'info',
-                                   'type': 'no_fillable_col',
-                                   'row': kt,
-                                   'message': f'行 "{kt}" 没有可填列 '
-                                              f'(如检查要求说明行), 不进 rows'})
+        headers = topology['headers']
+        header_cols = {hname: hc for hc, hname in headers.items()}
+        for table_row in topology['rows']:
+            kc = table_row['key_cell']
+            kt = table_row['key']
+            row_doc = {'key': kt, 'key_cell': ref(kc)}
+            add_label(kc, None)
+            for hname, target in table_row['columns'].items():
+                if target is None or not target.get('addr'):
+                    report.append({'level': 'warn',
+                                   'type': 'missing_col',
+                                   'row': kt, 'col': hname,
+                                   'message': f'行 "{kt}" 缺列 '
+                                              f'"{hname}" 的值格'})
+                    continue
+                col = {'cell': ref(target)}
+                if (target.get('text') or '').strip():
+                    col['text'] = target['text']
+                if '实测' in norm(hname):
+                    # 实测值类列: 登记列区内全部子格 (按 行,x 序),
+                    # 数据简表 measured 列表按序拆格填入 (模板拆格子)
+                    hc = header_cols[hname]
+                    hcell = by_grid.get((header_row, hc))
+                    r = kc['row']
+                    rs = kc.get('rowspan', 1)
+                    if hcell is not None and rs:
+                        hx0 = hcell['x']
+                        hx1 = hcell['x'] + hcell['w']
+                        subs = [c for c in cells
+                                if c is not kc and c.get('addr')
+                                and hx0 - 1 <= c['x'] + c['w'] / 2
+                                < hx1 + 1
+                                and r <= c['row'] < r + rs]
+                        subs.sort(key=lambda c: (c['row'], c['x']))
+                        col['cells'] = [ref(c) for c in subs]
+                        report.append({
+                            'level': 'info', 'type': 'value_cells',
+                            'row': kt, 'col': hname,
+                            'count': len(col['cells']),
+                            'message': f'行 "{kt}" 列 "{hname}" 有 '
+                                       f'{len(col["cells"])} 个值格, '
+                                       f'measured 按序拆格填入'})
+                row_doc.setdefault('columns', {})[hname] = col
+            if row_doc.get('columns'):
+                rows.append(row_doc)
+            else:
+                report.append({'level': 'info',
+                               'type': 'no_fillable_col',
+                               'row': kt,
+                               'message': f'行 "{kt}" 没有可填列 '
+                                          f'(如检查要求说明行), 不进 rows'})
 
     # ---- by_label 兜底: 表尾 label 角色格 (检查结论/审核人 等) ----
     registered = {e['cell'] for lst in by_label.values() for e in lst}
@@ -351,6 +349,30 @@ def build_index(data):
             if value_u:
                 x['value'] = value_u
             ent.append(x)
+
+    # 重名数据行显式报告; 匹配阶段仍会按输入顺序逐行各消费一次。
+    duplicate_rows = {}
+    for i, row in enumerate(rows):
+        duplicate_rows.setdefault(norm(row.get('key')), []).append(i)
+    for key, positions in duplicate_rows.items():
+        if key and len(positions) > 1:
+            report.append({
+                'level': 'warn', 'type': 'duplicate_row', 'row': key,
+                'count': len(positions), 'rows': positions,
+                'message': f'数据区重名行 "{key}" 共 {len(positions)} 行, '
+                           f'匹配时按顺序逐行消费'})
+
+    # xlsx 对齐失败或纯图片通路使用几何伪地址, 索引必须保留降级痕迹。
+    pseudo_cells = sum(1 for c in cells
+                       if str(c.get('addr') or '').startswith('#G'))
+    pseudo_texts = sum(1 for t in data.get('texts') or []
+                       if str(t.get('addr') or '').startswith('#T'))
+    if pseudo_cells or pseudo_texts:
+        report.append({
+            'level': 'warn', 'type': 'alignment_degraded',
+            'cells': pseudo_cells, 'texts': pseudo_texts,
+            'message': f'语义对齐降级为几何伪地址: 格子 {pseudo_cells} 个, '
+                       f'游离文字 {pseudo_texts} 个'})
 
     data['index'] = {
         'meta': {'title': (data.get('form') or {}).get('meta', {})

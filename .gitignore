@@ -6,7 +6,7 @@ __pycache__/
 # 密钥/令牌缓存
 .baidu_token_cache.json
 
-# 生成产物 (可由 extract_grid.py 重新生成)
+# 生成产物 (可由 CLI: python -m backend.template_pipeline.pipeline.cli 重新生成)
 grid_out/
 _tmp_form/
 out/
@@ -15,3 +15,6 @@ _sandbox/
 
 # Office/WPS 锁文件
 ~$*
+
+# frp 二进制（从 GitHub Release 下载，见 deploy/README.md）
+deploy/bin/

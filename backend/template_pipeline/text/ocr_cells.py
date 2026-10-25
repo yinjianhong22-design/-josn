@@ -4,9 +4,17 @@
 # 逐格 OCR (本地 RapidOCR / 转发本地 OCR 服务)
 # ---------------------------------------------------------------------------
 
+from functools import lru_cache
+
 from ..common import (base64, cv2, json, np, os, urllib,
                        _OCR_TEXT_SCORE)
 from .ocr_engine import _make_ocr_engine
+
+
+@lru_cache(maxsize=None)
+def _get_ocr_engine(use_gpu=None):
+    """按构造参数缓存本地引擎；远程 HTTP 通路不经过这里。"""
+    return _make_ocr_engine(use_gpu=use_gpu)
 
 
 def _tight_crop(crop, margin=8):
@@ -92,7 +100,7 @@ def ocr_cells(img, cells, inset=4):
     检测对单字格会漏检, 这种情况退化为"紧贴内容整格识别"。
     返回 {(row,col): 文本}; 未安装 rapidocr-onnxruntime 时返回 None。
     """
-    engine = _make_ocr_engine()
+    engine = _get_ocr_engine()
     if engine is None:
         return None
     texts = {}
@@ -102,7 +110,9 @@ def ocr_cells(img, cells, inset=4):
             continue
         try:
             res, _ = engine(crop)
-        except Exception:
+        except Exception as e:
+            print(f'OCR 警告: 格[{c["row"]},{c["col"]}] 检测识别失败 '
+                  f'({type(e).__name__}: {e}), 尝试整格识别')
             res = None
         if res:
             texts[(c['row'], c['col'])] = '\n'.join(_reading_order(res))
@@ -113,7 +123,9 @@ def ocr_cells(img, cells, inset=4):
             continue
         try:
             rec_res, _ = engine.text_recognizer([sub])
-        except Exception:
+        except Exception as e:
+            print(f'OCR 警告: 格[{c["row"]},{c["col"]}] 整格识别失败 '
+                  f'({type(e).__name__}: {e}), 跳过此格')
             continue
         if rec_res and float(rec_res[0][1]) >= _OCR_TEXT_SCORE:
             texts[(c['row'], c['col'])] = rec_res[0][0]

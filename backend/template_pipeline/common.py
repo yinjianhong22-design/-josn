@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-extract_grid.py
+backend/template_pipeline (CLI: python -m backend.template_pipeline.pipeline.cli)
 
 图片/扫描件: OpenCV 提取横竖直线 -> 交点 -> 小格子(含合并单元格), 版面分析
 (文字块/行切分)约束字号与位置, OCR 识别文字。
@@ -24,9 +24,9 @@ cells 表带几何与填充 mode (overwrite/replace/append/inline), 边界情况
 回填契约: 按 addr 找到格子, 改 text、删 lines, 几何与边框不动。
 
 用法:
-    python extract_grid.py input.png [-o out_dir]
-    python extract_grid.py input.pdf [--page 0] [--dpi 300]
-    python extract_grid.py input.docx | input.xlsx
+    python -m backend.template_pipeline.pipeline.cli input.png [-o out_dir]
+    python -m backend.template_pipeline.pipeline.cli input.pdf [--page 0] [--dpi 300]
+    python -m backend.template_pipeline.pipeline.cli input.docx | input.xlsx
 
 依赖:
     pip install opencv-python numpy rapidocr-onnxruntime
@@ -36,7 +36,6 @@ cells 表带几何与填充 mode (overwrite/replace/append/inline), 边界情况
     lines.json   横线/竖线坐标、交点、每个格子(含 rowspan/colspan/文字)
     overlay.png  在原图上画出线、交点、格子编号，便于人工核对
     data.json    标准 JSON: dpi + 整页几何 + 格子(边框/文字) + 格外游离文字
-    rebuilt.pdf  按 data.json 重画的矢量 PDF 整页 (表格 + 页眉标题页码)
     data.js      同一份数据包成 window.TABLE_DATA, 供 file:// 直接打开
     index.html   纯渲染层: 读 data.js, 按 JSON 映射还原出像素级表格
 """
@@ -52,8 +51,11 @@ import urllib.request
 import cv2
 import numpy as np
 
+from .constants import _IMG_EXT, _NO_LABEL_PREFIX, _OCR_TEXT_SCORE, _jsonable
+
 # ---------------------------------------------------------------------------
 # 共享模块级内容: PyMuPDF 导入 / 跨模块常量 / 小工具
+# 纯常量与 _jsonable 位于 constants.py, 此处 re-export 保持旧调用兼容。
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -71,20 +73,3 @@ def _import_pymupdf():
             return fitz
         except ImportError:
             sys.exit('读取 PDF 需要 PyMuPDF:  pip install pymupdf')
-
-# 识别置信度阈值: 构造引擎 (text_score) 与逐格兜底判定共用,
-# ocr_service.py 侧也引用此值, 改一处两端一致
-_OCR_TEXT_SCORE = 0.3
-
-_NO_LABEL_PREFIX = tuple('0123456789△▲□■＋±+-≤≥<>＝=%')
-
-def _jsonable(v):
-    """把 openpyxl 单元格值转成 JSON 可序列化形态。"""
-    import datetime
-    if v is None or isinstance(v, (int, float, str, bool)):
-        return v
-    if isinstance(v, (datetime.datetime, datetime.date, datetime.time)):
-        return v.isoformat()
-    return str(v)
-
-_IMG_EXT = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp')

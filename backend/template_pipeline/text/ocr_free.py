@@ -6,28 +6,10 @@
 
 from importlib import import_module as _import_module
 
+from .line_roles import _classify_line_roles
+
 _content = _import_module('..layout.content', __package__)
 split_text_lines = _content.split_text_lines
-
-
-def _classify_line_roles(lines, page_w):
-    """字号聚类 + 坐标规则, 给每行文字定语义角色 (title/heading/body)。
-
-    以字号中位数为正文基准: 明显大于正文且接近页面水平居中 -> 标题;
-    明显大于正文但不居中 -> 小标题; 其余为正文。
-    """
-    if not lines:
-        return
-    sizes = sorted(l['size'] for l in lines)
-    body = sizes[len(sizes) // 2]
-    for l in lines:
-        centered = abs(l['cx'] - page_w / 2) < page_w * 0.12
-        if l['size'] >= body * 1.3:
-            l['role'] = 'title' if centered else 'heading'
-        elif l['size'] >= body * 1.12:
-            l['role'] = 'heading'
-        else:
-            l['role'] = 'body'
 
 
 def ocr_free_blocks(img, blocks, cells, content, backend, dpi):

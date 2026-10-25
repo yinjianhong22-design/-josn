@@ -4,14 +4,21 @@
 # OCR 引擎构造 (RapidOCR, 本地 GPU/CPU 自动探测)
 # ---------------------------------------------------------------------------
 
-from ..common import os, _OCR_TEXT_SCORE
+import os
+
+from ..constants import _OCR_TEXT_SCORE
+
+
+# DLL 目录/库句柄必须活到 CUDA provider 加载之后。
+_CUDA_DLL_DIRECTORY_HANDLES = []
+_CUDA_DLL_HANDLES = []
 
 
 def _prepend_nvidia_cuda_dlls():
     """onnxruntime-gpu >= 1.24 的 Windows wheel 不再捆绑 CUDA/cuDNN DLL;
-    若通过 nvidia-*-cu12 pip 包提供, 需要把它们的 bin 目录加进 PATH,
-    供 onnxruntime_providers_cuda.dll 解析依赖 (cublasLt/cudnn/cufft/
-    cudart)。返回是否找到并加入。
+    若通过 nvidia-*-cu12 pip 包提供, 需要注册它们的 bin 目录, 供
+    onnxruntime_providers_cuda.dll 解析依赖 (cublasLt/cudnn/cufft/cudart)。
+    返回是否找到并加入。
     """
     from pathlib import Path
     try:
@@ -23,6 +30,28 @@ def _prepend_nvidia_cuda_dlls():
     if not bins:
         return False
     os.environ['PATH'] = os.pathsep.join(bins + [os.environ.get('PATH', '')])
+    try:
+        if hasattr(os, 'add_dll_directory'):
+            registered = {str(h.path) for h in _CUDA_DLL_DIRECTORY_HANDLES}
+            for directory in bins:
+                if directory not in registered:
+                    _CUDA_DLL_DIRECTORY_HANDLES.append(
+                        os.add_dll_directory(directory))
+        if os.name == 'nt':
+            # ORT 用带 ALTERED_SEARCH_PATH 的 LoadLibrary 加载 provider;
+            # 仅注册目录在本机仍会漏依赖, 先显式加载其直接依赖。
+            import ctypes
+            for package, names in (
+                    ('cuda_runtime', ('cudart64_12.dll',)),
+                    ('cublas', ('cublas64_12.dll', 'cublasLt64_12.dll')),
+                    ('cufft', ('cufft64_11.dll',)),
+                    ('cudnn', ('cudnn64_9.dll',))):
+                for name in names:
+                    _CUDA_DLL_HANDLES.append(
+                        ctypes.WinDLL(str(nvidia / package / 'bin' / name)))
+    except OSError as e:
+        print(f'CUDA 运行库加载失败: {e}')
+        return False
     return True
 
 
@@ -105,4 +134,5 @@ def _make_ocr_engine(use_gpu=None):
     try:
         return RapidOCR(text_score=_OCR_TEXT_SCORE)
     except Exception:
-        return RapidOCR()
+        # 最后一次兜底也显式传阈值, 避免静默退回模型默认值。
+        return RapidOCR(text_score=_OCR_TEXT_SCORE)

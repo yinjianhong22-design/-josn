@@ -9,11 +9,14 @@ from importlib import import_module as _import_module
 from ..common import _NO_LABEL_PREFIX
 
 _xlsx_anchor = _import_module('..align.xlsx_anchor', __package__)
-_norm_text = _xlsx_anchor._norm_text
-_group_free_text_lines = _xlsx_anchor._group_free_text_lines
-_pick_header_row = _xlsx_anchor._pick_header_row
-_label_col = _xlsx_anchor._label_col
-_table_rows_set = _xlsx_anchor._table_rows_set
+from .table_topology import (
+    _group_free_text_lines,
+    _label_col,
+    _norm_text,
+    _pick_header_row,
+    _table_rows_set,
+    discover_table,
+)
 
 
 # 值格占位文本: 年月日样式 (允许数字/点/横线), 如 "年  月  日"
@@ -37,8 +40,8 @@ def extract_fields(data):
 
     - 格内联冒号: 整格文本形如 "编 号：xxx" -> inline 字段, prefix 为冒号前;
     - 标签->值对: label 角色格优先配右邻 (下划线占位格也算), 下邻次之;
-    - 游离文字行: 按基线聚行后同样匹配冒号模式, 用 addr 或 #T{n} 寻址,
-      segs 为该行涉及的 texts 下标, value_seg 为值起始的下标位置;
+    - 游离文字行: 按基线聚行后同样匹配冒号模式, 用原生 addr 或几何 #T
+      伪地址寻址, value_seg 为值起始的下标位置;
     - 表体行: 表头行之下, 行标签列 = 非空格最多的列; 每个行标签下,
       只收集"标签行该列为空"的表头列, 优先取下一行 (专用填写行) 的地址。
     """
@@ -106,10 +109,8 @@ def extract_fields(data):
     # 2.5) 格内右侧留白型: 标签与值探测成同一格, 但原生 colspan 内锚点
     #      右侧还有空格 (value_room, 对齐阶段记录) -> 值追加写在同一格
     #      标签之后 (如 "抽检时间" 后的大片空格)
-    header_row0 = _pick_header_row(
-        cells, {c['row'] for c in cells if c.get('role') == 'header'})
-    table_rows = _table_rows_set(cells, header_row0) \
-        if header_row0 is not None else set()
+    topology = discover_table(cells)
+    table_rows = topology['table_rows']
     claimed = {a for f in fields for a in (f.get('label'), f.get('value'))}
     for c in cells:
         if c.get('role') in ('header', 'title', 'value') \
@@ -183,52 +184,18 @@ def extract_fields(data):
                 entry['value_seg'] = vs
             fields.append(entry)
 
-    # 4) 表体行字段
-    header_row = _pick_header_row(
-        cells, {c['row'] for c in cells if c.get('role') == 'header'})
-    if header_row is not None:
-        headers = {}
-        for c in cells:
-            if c['row'] == header_row and text_of(c):
-                headers.setdefault(c['col'], text_of(c))
-        table_rows = _table_rows_set(cells, header_row)
-        body = [c for c in cells if c['row'] in table_rows]
-        counts = {}
-        for c in body:
-            if text_of(c):
-                counts[c['col']] = counts.get(c['col'], 0) + 1
-        if counts:
-            label_col = _label_col(counts)
-            for c in sorted(body, key=lambda x: (x['row'], x['col'])):
-                t = text_of(c)
-                if c['col'] != label_col or not t:
-                    continue
-                entry = {'row_label': t, 'cells': {}}
-                if c.get('addr'):
-                    entry['row'] = c['addr']
-                for hc, hname in headers.items():
-                    if hc == label_col:
-                        continue
-                    same = by_grid.get((c['row'], hc))
-                    if same is None or text_of(same):
-                        continue  # 该列此行已有内容 (如规定值), 不是填写列
-                    # 本行空格优先; 下一行 (专用填写行) 仅在本行无地址时
-                    # 回退, 否则会错位到备用空行
-                    for rr in (c['row'], c['row'] + 1):
-                        tc = by_grid.get((rr, hc))
-                        if tc is None or text_of(tc) or not tc.get('addr'):
-                            continue
-                        if rr == c['row'] + 1:
-                            # 下一行已是新条目 -> 本行该列的留空不属于本条目;
-                            # 本格跨行 (rowspan>1) 时回退到本格 (合格率列
-                            # 纵向合并, 值就写在合并格里)
-                            lbl = by_grid.get((rr, label_col))
-                            if lbl is not None and text_of(lbl):
-                                continue
-                        entry['cells'][hname] = tc['addr']
-                        break
-                if entry['cells']:
-                    table_fields.append(entry)
+    # 4) 表体行字段 (拓扑和值格候选与 build_index 共用同一次发现)
+    for row in topology['rows']:
+        c = row['key_cell']
+        entry = {'row_label': row['key'], 'cells': {}}
+        if c.get('addr'):
+            entry['row'] = c['addr']
+        for hname, target in row['columns'].items():
+            if target is None or text_of(target):
+                continue  # 已有内容 (如规定值) 不是 table_fields 的填写列
+            entry['cells'][hname] = target['addr']
+        if entry['cells']:
+            table_fields.append(entry)
 
     data['fields'] = fields
     data['table_fields'] = table_fields

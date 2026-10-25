@@ -4,7 +4,9 @@
 # 输入类型判定
 # ---------------------------------------------------------------------------
 
-from ..common import os, _IMG_EXT
+import os
+
+from ..constants import _IMG_EXT
 
 
 def detect_input_type(input_path):

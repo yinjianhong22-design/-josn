@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 
 # ---------------------------------------------------------------------------
-# Word/Excel -> PDF (本机 WPS/Office COM 排版引擎, 高保真)
+# Word/Excel -> PDF (排版引擎降级链: wpscli -> WPS/Office COM; 都不可用
+# 返回 None, 由调用方回退 python-docx/openpyxl 简化排版)
 # ---------------------------------------------------------------------------
 
-from ..common import os
+# 只用标准库 os (不 from ..common import), 保持零重依赖:
+# 本模块可被 office2pdf.py 独立引用而不拖入 opencv/numpy 等重包
+import os
 
 
 def _find_wpscli():
@@ -102,8 +105,8 @@ def office_to_pdf(path, out_dir):
     转出的 PDF 走电子档通路。
 
     优先用 WPS 官方命令行 wpscli (word2pdf/excel2pdf, 渲染正确);
-    找不到再退到 WPS/Office COM 接口; 都不可用返回 None,
-    由调用方回退到 python-docx/openpyxl 简化排版。
+    找不到再退到 WPS/Office COM 接口 (Windows, 需 pywin32); 都不可用返回
+    None, 由调用方回退到 python-docx/openpyxl 简化排版。
     """
     import subprocess
 
@@ -137,61 +140,113 @@ def office_to_pdf(path, out_dir):
         except Exception as e:
             print(f'wpscli 转换失败: {e}')
 
+    return _office_com_to_pdf(ext, abs_in, cur_in, abs_out)
+
+
+def _office_com_to_pdf(ext, abs_in, cur_in, abs_out, timeout=300):
+    """WPS/Office COM 转换 (Windows 本机), 成功返回 pdf 路径, 失败返回 None。
+
+    COM 调用放在守护工作线程中并限制等待时间; 超时后尝试 Quit, 但不强行
+    终止仍在 COM 调用里的线程。目标旧文件先删除, 避免误认上次转换结果。
+    """
     try:
         import pythoncom
         import win32com.client
     except ImportError:
-        print('未安装 pywin32, 跳过 Office 转换 (pip install pywin32)')
+        print('未安装 pywin32, 跳过 Office COM 转换 (pip install pywin32)')
         return None
+    import threading
+
+    try:
+        if os.path.exists(abs_out):
+            os.remove(abs_out)
+    except OSError as e:
+        print(f'Office 转换失败: 无法删除旧 PDF ({e})')
+        return None
+
     progids = (['Kwps.Application', 'wps.Application', 'Word.Application']
                if ext == '.docx'
                else ['Ket.Application', 'et.Application', 'Excel.Application'])
-    pythoncom.CoInitialize()
-    app = None
-    try:
-        for pid in progids:
+    state = {'app': None, 'err': None}
+    done = threading.Event()
+
+    def convert():
+        app = None
+        pythoncom.CoInitialize()
+        try:
+            for pid in progids:
+                try:
+                    app = win32com.client.DispatchEx(pid)
+                    state['app'] = app
+                    print(f'Office 转换: 使用 {pid}')
+                    break
+                except Exception:
+                    app = None
+            if app is None:
+                state['err'] = '未找到可用的 WPS/Office COM 接口'
+                return
             try:
-                app = win32com.client.DispatchEx(pid)
-                print(f'Office 转换: 使用 {pid}')
-                break
+                app.Visible = False
             except Exception:
-                app = None
-        if app is None:
-            print('未找到可用的 WPS/Office COM 接口')
-            return None
-        try:
-            app.Visible = False
-        except Exception:
-            pass
-        err = None
-        for _ in range(2):  # WPS 冷启动/残留实例时第一次调用可能失败, 重试一次
+                pass
+            for _ in range(2):  # 冷启动/残留实例时首次调用可能失败, 重试一次
+                doc = wb = None
+                try:
+                    if ext == '.docx':
+                        doc = app.Documents.Open(abs_in, ReadOnly=True)
+                        try:
+                            doc.ExportAsFixedFormat(abs_out, 17)
+                        except Exception:
+                            doc.SaveAs(abs_out, FileFormat=17)  # wdFormatPDF
+                    else:
+                        # 注意: ET 的 Workbooks.Open 不支持 ReadOnly 关键字
+                        wb = app.Workbooks.Open(cur_in)
+                        wb.ExportAsFixedFormat(0, abs_out)    # xlTypePDF
+                    break
+                except Exception as e:
+                    state['err'] = e
+                finally:
+                    for item in (doc, wb):
+                        try:
+                            if item is not None:
+                                item.Close(False)
+                        except Exception:
+                            pass
+        except Exception as e:
+            state['err'] = e
+        finally:
             try:
-                if ext == '.docx':
-                    doc = app.Documents.Open(abs_in, ReadOnly=True)
-                    try:
-                        doc.ExportAsFixedFormat(abs_out, 17)
-                    except Exception:
-                        doc.SaveAs(abs_out, FileFormat=17)  # wdFormatPDF
-                    doc.Close(False)
-                else:
-                    # 注意: ET 的 Workbooks.Open 不支持 ReadOnly 关键字
-                    wb = app.Workbooks.Open(cur_in)
-                    wb.ExportAsFixedFormat(0, abs_out)    # xlTypePDF
-                    wb.Close(False)
-                break
-            except Exception as e:
-                err = e
-        if not os.path.exists(abs_out):
-            print(f'Office 转换失败: {err}')
-            return None
-        return abs_out
-    except Exception as e:
-        print(f'Office 转换失败: {e}')
-        return None
-    finally:
-        try:
-            if app is not None:
+                if app is not None:
+                    app.Quit()
+            except Exception:
+                pass
+            pythoncom.CoUninitialize()
+            done.set()
+
+    worker = threading.Thread(target=convert, name='office-com-to-pdf',
+                              daemon=True)
+    worker.start()
+    if not done.wait(timeout):
+        print(f'Office 转换失败: COM 操作超过 {timeout} 秒, 尝试退出 Office')
+        app = state.get('app')
+        if app is not None:
+            initialized = False
+            try:
+                pythoncom.CoInitialize()
+                initialized = True
                 app.Quit()
-        except Exception:
-            pass
-        pythoncom.CoUninitialize()
+            except Exception:
+                pass
+            finally:
+                if initialized:
+                    pythoncom.CoUninitialize()
+        return None
+
+    try:
+        valid_output = os.path.isfile(abs_out) and os.path.getsize(abs_out) > 0
+    except OSError:
+        valid_output = False
+    if not valid_output:
+        print(f'Office 转换失败: {state["err"] or "未生成新的 PDF 文件"}')
+        return None
+    return abs_out

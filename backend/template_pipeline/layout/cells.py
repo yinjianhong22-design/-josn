@@ -33,6 +33,10 @@ def _edge_present(mask, p1, p2, axis, thickness=2, density=0.4):
     return proj.mean() >= density
 
 
+# 公开给整页数据模型使用；私有名保留给既有调用方。
+edge_present = _edge_present
+
+
 def find_cells(h_pos, v_pos, horiz, vert):
     """推出小格子(含合并单元格)。
 

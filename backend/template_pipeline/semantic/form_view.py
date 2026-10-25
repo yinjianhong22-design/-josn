@@ -25,7 +25,7 @@ def build_form_view(data):
       replace 整格替换 (占位文字视为示例值)
       inline  同行冒号内联, 替换 prefix 之后的文本
     游离文字的值宽按字号估算 (estimated=true)。渲染层 cells/texts/rules
-    保持不变, json_to_pdf / index.html 照常消费。
+    保持不变, index.html / 前端复现层照常消费。
     """
     by_addr = {}
     cells = data['cells']
